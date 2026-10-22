@@ -50,9 +50,18 @@ bash src/scripts/realtime_remote.sh --restart  # pull latest code and restart th
 bash src/scripts/realtime_remote.sh --stop     # stop the remote server
 ```
 
-In the browser: click the coronal overview to place the probe, wheel to
-rotate; keys W/S (elevation), A/D (lateral), Q/E (rotate), R/F (tilt),
-Z/X (rock), Shift for larger steps. "Save scene" writes the phantom, pose
-and imaging parameters to `outputs/scenes/` for the data-generation side.
+Probe Lab (browser): 3D view of skin / glandular tissue / lesions with the
+probe and the live scan plane (click the skin to place the probe, drag to
+orbit); lesion list with "Go"; scan presets that approximate BUSI, BUS-BRA,
+BrEaST and TDSC-ABUS acquisition (`src/breastsim/presets.py`); keys W/S
+(elevation), A/D (lateral), Q/E (rotate), R/F (tilt), Z/X (rock), Shift for
+larger steps. "Save scene" writes phantom, pose and imaging parameters to
+`outputs/scenes/` for the data-generation side.
 
-Headless check: `python src/scripts/render_preview.py usct/A --sweep 3`.
+Checks:
+
+```bash
+python -m pytest                                              # unit + server tests (synthetic phantom)
+python src/scripts/render_preview.py usct/A --preset breast  # headless frames
+PLAYWRIGHT_BROWSERS_PATH=~/langtian/envs/.playwright python src/scripts/e2e_check.py   # UI end-to-end (127)
+```
