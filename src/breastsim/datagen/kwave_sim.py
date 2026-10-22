@@ -137,10 +137,16 @@ def simulate(maps, spec, angles_deg=(-8, -4, 0, 4, 8), cfl=0.3, gpu=True, log=pr
 
     dx = maps["dx"] * 1e-3
     nz, nx = maps["c"].shape
-    kgrid = kWaveGrid([nz, nx], [dx, dx])
     depth = nz * dx
-    medium = kWaveMedium(sound_speed=maps["c"], density=maps["rho"], alpha_coeff=maps["alpha"],
-                         alpha_power=maps["alpha_power"])
+
+    def grid_and_medium():
+        # k-Wave pads the grid and medium arrays with the PML in place, so each run gets fresh ones
+        kg = kWaveGrid([nz, nx], [dx, dx])
+        kg.makeTime(float(maps["c"].max()), cfl, t_end)
+        med = kWaveMedium(sound_speed=maps["c"].copy(), density=maps["rho"].copy(),
+                          alpha_coeff=maps["alpha"].copy(), alpha_power=maps["alpha_power"])
+        return kg, med
+
     fc, bw = spec.fc, spec.bandwidth
     sig_t = 1 / (2 * np.pi * (bw * fc / 2.355))                 # Gaussian envelope of the pulse
     t_c = 4 * sig_t
@@ -155,7 +161,7 @@ def simulate(maps, spec, angles_deg=(-8, -4, 0, 4, 8), cfl=0.3, gpu=True, log=pr
     mask[0, cols] = True
     max_delay = (x_el[-1] - x_el[0]) * np.sin(np.deg2rad(max(abs(a) for a in angles_deg))) / C0
     t_end = 2 * depth / 1400 + 2 * t_c + max_delay
-    kgrid.makeTime(float(maps["c"].max()), cfl, t_end)
+    kgrid, _ = grid_and_medium()
     t = kgrid.t_array.ravel()
     pml = (_nice(nz), _nice(nx))
     rf = []
@@ -169,6 +175,7 @@ def simulate(maps, spec, angles_deg=(-8, -4, 0, 4, 8), cfl=0.3, gpu=True, log=pr
         src.p = (np.exp(-0.5 * (tt / sig_t) ** 2) * np.sin(2 * np.pi * fc * tt)).astype(np.float32)
         sensor = kSensor(mask=mask, record=["p"])
         t0 = time.time()
+        kgrid, medium = grid_and_medium()
         out = kspaceFirstOrder2D(kgrid, src, sensor, medium,
                                  SimulationOptions(pml_inside=False, pml_size=list(pml), data_cast="single",
                                                    save_to_disk=True),
