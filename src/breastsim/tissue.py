@@ -22,13 +22,18 @@ ANGIOGENESIS = 190
 TUMOR = 200
 NECROSIS = 210
 VEIN = 225
+# chest wall, generated procedurally behind the breast (not in the source phantoms)
+MUSCLE = 40          # pectoralis / intercostal muscle
+FASCIA = 45          # pectoral fascia and perimysial septa
+RIB = 60
+LUNG = 70            # aerated lung behind the pleura
 
 NAMES = {
     BACKGROUND: "background", FAT: "fat", SKIN: "skin", EPIDERMIS: "epidermis",
     GLAND: "glandular", NIPPLE: "nipple", LIGAMENT: "ligament", TDLU: "TDLU",
     DUCT: "duct", ARTERY: "artery", CYST: "simple cyst", FIBROADENOMA: "fibroadenoma",
     ANGIOGENESIS: "peripheral angiogenesis", TUMOR: "viable tumor", NECROSIS: "necrotic core",
-    VEIN: "vein",
+    VEIN: "vein", MUSCLE: "muscle", FASCIA: "fascia", RIB: "rib", LUNG: "lung (air)",
 }
 
 # Labels that make up the segmentation / detection target. Peripheral
@@ -36,8 +41,14 @@ NAMES = {
 # tissue around a tumour, not a sonographic mass, so it is not a lesion label.
 LESIONS = (CYST, FIBROADENOMA, TUMOR, NECROSIS)
 
+# Diffuse fraction of boundary echoes (specular otherwise): soft-tissue interfaces
+# are smooth, the cortical bone surface and the pleura are rough and stay bright
+# at oblique incidence.
+ROUGHNESS = {RIB: 0.8, LUNG: 0.6}
+DEFAULT_ROUGHNESS = 0.25
+
 # Sheet- or tube-like structures thinner than the ultrasound beam.
-THIN_STRUCTURES = (SKIN, EPIDERMIS, LIGAMENT, DUCT, ARTERY, VEIN)
+THIN_STRUCTURES = (SKIN, EPIDERMIS, LIGAMENT, DUCT, ARTERY, VEIN, FASCIA)
 
 # Relative backscatter amplitude (std of sub-resolution scatterers).
 # Breast US appearance: fat hypoechoic, glandular / ligaments / skin
@@ -46,6 +57,7 @@ ECHOGENICITY = {
     BACKGROUND: 0.0, FAT: 0.35, SKIN: 1.1, EPIDERMIS: 1.3, GLAND: 1.0, NIPPLE: 0.5,
     LIGAMENT: 1.4, TDLU: 0.7, DUCT: 0.1, ARTERY: 0.03, CYST: 0.02, FIBROADENOMA: 0.25,
     ANGIOGENESIS: 0.4, TUMOR: 0.1, NECROSIS: 0.05, VEIN: 0.03,
+    MUSCLE: 0.3, FASCIA: 1.3, RIB: 0.0, LUNG: 0.0,
 }
 
 # Acoustic properties for sources that only provide labels (OA-Breast):
@@ -57,6 +69,11 @@ DEFAULT_ACOUSTIC = {
     SKIN: (1650.0, 1150.0, 21.2),
     GLAND: (1515.0, 1040.0, 8.64),
     VEIN: (1584.0, 1040.0, 1.5),
+    # chest wall (Duck 1990 / IT'IS database typical values; attenuation in Np/m/MHz)
+    MUSCLE: (1580.0, 1090.0, 11.5),
+    FASCIA: (1550.0, 1120.0, 14.5),
+    RIB: (3200.0, 1900.0, 230.0),
+    LUNG: (343.0, 1.2, 1000.0),
 }
 DEFAULT_ALPHA_POWER = 1.2
 
@@ -87,6 +104,7 @@ COLORS = {
     GLAND: (120, 170, 240), NIPPLE: (200, 120, 200), LIGAMENT: (250, 250, 250), TDLU: (90, 140, 220),
     DUCT: (60, 90, 200), ARTERY: (220, 40, 40), CYST: (40, 220, 220), FIBROADENOMA: (240, 200, 40),
     ANGIOGENESIS: (250, 120, 40), TUMOR: (250, 40, 40), NECROSIS: (130, 20, 20), VEIN: (60, 40, 200),
+    MUSCLE: (170, 60, 70), FASCIA: (235, 210, 210), RIB: (245, 240, 220), LUNG: (40, 40, 60),
 }
 
 

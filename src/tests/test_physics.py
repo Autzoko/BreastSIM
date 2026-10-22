@@ -96,8 +96,10 @@ def test_speed_of_sound_moves_boundaries_like_a_scanner():
 
 
 def test_output_speckle_is_rayleigh():
+    # physics check on a grid fine enough that scan conversion needs no anti-alias filter
+    # (coarser display grids low-pass the envelope, as scanners do, raising the SNR)
     vol = layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6)
-    r, _, meta, _ = render(vol)
+    r, _, meta, _ = render(vol, px_x_mm=0.05, px_z_mm=0.05)
     env = np.sqrt(r.last_intensity.cpu().numpy())
     w = env[int(10 / meta["px_z_mm"]):int(30 / meta["px_z_mm"]), 60:-60]
     assert w.mean() / w.std() == pytest.approx(1.91, rel=0.1)
@@ -203,3 +205,26 @@ def test_thin_ligament_parallel_to_beam_casts_only_a_faint_streak():
     streak = prof[centre - int(0.5 / px):centre + int(0.5 / px)].mean()
     beside = np.r_[prof[: centre - int(5 / px)], prof[centre + int(5 / px):]].mean()
     assert beside - streak < 3.5
+
+
+def test_chest_wall_muscle_ribs_and_rib_shadows():
+    # thin flat breast (12 mm of fat) on the procedural chest wall
+    shape = tuple(int(s / VOX) for s in (12, 70, 60))
+    label = np.full(shape, tissue.FAT, np.uint8)
+    z = np.full(shape, 1.35, np.float16)
+    c = np.full(shape, 1440.0, np.float16)
+    al = np.full(shape, 0.4 * tissue.NP_PER_M_PER_DB_PER_CM, np.float16)
+    vol = phantom.Volume("test/chest", label, z, al, VOX, 1.0, np.full(shape[1:], 12.0, np.float32),
+                         np.zeros(shape[1:], bool), {}, c, np.zeros(shape, np.uint8))
+    phantom.add_chest_wall(vol)
+    assert vol.a0_mm == pytest.approx(-25.0) and vol.label.shape[0] == shape[0] + 125
+    r, _, meta, labels = render(vol, depth_mm=40.0, edge_shadow_db=12.0)
+    present = set(np.unique(labels).tolist())
+    assert {tissue.MUSCLE, tissue.RIB, tissue.LUNG} <= present
+    inten = 10 * np.log10(r.last_intensity.cpu().numpy() + 1e-12)
+    rib_cols = np.nonzero((labels == tissue.RIB).any(0))[0]
+    gap_cols = np.nonzero(~(labels == tissue.RIB).any(0))[0]
+    below_ribs = np.nonzero((labels == tissue.RIB).any(1))[0].max() + int(1 / meta["px_z_mm"])
+    deep = slice(below_ribs, below_ribs + int(4 / meta["px_z_mm"]))
+    # bone shadows: far darker behind ribs than behind the intercostal spaces (pleura is bright there)
+    assert inten[deep][:, rib_cols].mean() < inten[deep][:, gap_cols].mean() - 10

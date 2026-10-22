@@ -90,6 +90,8 @@ def _phantom_info(vol):
         "lesions": lesions, "start": {"u": start[0], "v": start[1]},
         "surface_range_mm": [float(np.nanmin(vol.surface)), float(np.nanmax(vol.surface))],
         "nipple_mm": _nipple(vol),
+        "a_range_mm": [vol.a0_mm, vol.a0_mm + vol.label.shape[0] * vol.voxel_mm],
+        "chest_wall": vol.meta.get("chest_wall"),
     }
 
 

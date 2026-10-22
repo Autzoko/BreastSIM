@@ -164,6 +164,7 @@ class PreviewRenderer:
         self.lesion_lut[list(tissue.LESIONS)] = True
         self.thin_lut = torch.zeros(256, dtype=torch.bool, device=self.device)
         self.thin_lut[list(tissue.THIN_STRUCTURES)] = True
+        self.rough_lut = torch.tensor(tissue.lut(tissue.ROUGHNESS, default=tissue.DEFAULT_ROUGHNESS), device=self.device)
         self._att_luts = {}
 
     # ------------------------------------------------------------- volume
@@ -196,13 +197,14 @@ class PreviewRenderer:
         self._zsmooth = zs[None, None]
         self._norm = torch.tensor([(n - 1) * vol.voxel_mm / 2 for n in lab.shape],
                                   device=self.device, dtype=torch.float32)
+        self._origin = torch.tensor([vol.a0_mm, 0.0, 0.0], device=self.device, dtype=torch.float32)
         self.seed = zlib.crc32(vol.id.encode()) % 100_000  # stable across processes
         self.vol = vol
 
     def _sample(self, volume, pts, mode):
         """pts (..., 3) mm in (a, u, v) -> (C, ...) values (border-clamped)."""
         shape = pts.shape[:-1]
-        g = (pts.reshape(1, 1, 1, -1, 3) / self._norm - 1).flip(-1)  # grid_sample order (v, u, a)
+        g = ((pts.reshape(1, 1, 1, -1, 3) - self._origin) / self._norm - 1).flip(-1)  # grid order (v, u, a)
         out = F.grid_sample(volume, g, mode=mode, padding_mode="border", align_corners=True)
         return out.reshape(volume.shape[1], *shape)
 
@@ -309,7 +311,8 @@ class PreviewRenderer:
             exp(-(theta1 - theta2)^2 / (2 (2 theta0)^2)); the two-way transmission T^2
             is accumulated below the boundary -> refraction / edge shadows;
           - echo amplitude r = (Z2-Z1)/(Z2+Z1) times the angle factor
-            (1-s) exp(-theta^2 / (2 theta0^2)) + s cos theta, theta0 = 0.25/F#, s = 0.25.
+            (1-s) exp(-theta^2 / (2 theta0^2)) + s cos theta, theta0 = 0.25/F#, with the
+            diffuse fraction s from tissue.ROUGHNESS (0.25 soft tissue, 0.8 bone).
         Attenuation is integrated per plane (one-way A = int alpha ds) and turned into
         intensity with the spectral LUT; planes are averaged in intensity with the
         elevation beam weights. Returns (echo complex (nz, nx), intensity factor
@@ -327,7 +330,7 @@ class PreviewRenderer:
         ts = torch.linspace(-1.5, 1.5, n, device=dev) if n > 1 else torch.zeros(1, device=dev)
         ws = torch.exp(-0.5 * ts ** 2)
         ws = ws / ws.sum()
-        theta0, s_diff, h = 0.25 / p.lateral_f_number, 0.25, 0.2
+        theta0, h = 0.25 / p.lateral_f_number, 0.2
         # per-crossing cap of the two-way loss (Np): bulk interfaces up to edge_shadow_db, thin sheets
         # (ligaments, ducts, vessel walls, skin) much less - they are narrower than the beam, which
         # mostly passes around them
@@ -364,16 +367,19 @@ class PreviewRenderer:
                 if p.edge_shadow_db > 0:
                     thin = self.thin_lut[l1] | self.thin_lut[l2]
                     two_way = -2 * torch.log(T.clamp(min=1e-6))
-                    two_way = torch.where(thin, torch.clamp(0.3 * two_way, max=cap_thin), torch.clamp(two_way, max=cap_bulk))
+                    capped = torch.where(thin, torch.clamp(0.3 * two_way, max=cap_thin), torch.clamp(two_way, max=cap_bulk))
+                    # bone and air interfaces (|r| > 0.3) block the beam outright: no soft-tissue cap
+                    two_way = torch.where(((z2 - z1) / (z2 + z1)).abs() > 0.3, two_way.clamp(max=30.0), capped)
                     loss.index_put_((iz + 1, ix), two_way, accumulate=True)
                 # echo
                 r = (z2 - z1) / (z2 + z1)
+                s_diff = torch.maximum(self.rough_lut[l1], self.rough_lut[l2])      # rougher side dominates
                 factor = (1 - s_diff) * torch.exp(-0.5 * (theta / theta0) ** 2) + s_diff * cos1
                 zb = (iz + 1).float() * dz                                         # boundary depth
-                amp = 0.5 * w * r * factor                                         # split between rows iz, iz+1
+                # the echo leaves before the transmission loss of this crossing: last row above it
+                amp = w * r * factor
                 for o, comp in ((out_re, amp * torch.cos(k2 * zb)), (out_im, amp * torch.sin(k2 * zb))):
                     o.index_put_((iz, ix), comp, accumulate=True)
-                    o.index_put_((iz + 1, ix), comp, accumulate=True)
             inten += w * self._interp(A_lut, E_lut, A) * torch.exp(-torch.cumsum(loss, 0))
             a_mean += w * A
         return torch.complex(out_re[:nz], out_im[:nz]), inten, a_mean
@@ -419,7 +425,9 @@ class PreviewRenderer:
         spec_echo, att_int, A = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, e_ax, e_el),
                                                  dz, k2, p, spec, vol.alpha_power)
         A_lut, _, fbar_lut, sf_lut = self._att_lut(spec, vol.alpha_power)
-        A_row = A.mean(1)
+        # per-depth spectral state, weighted by the transmitted intensity: fully shadowed
+        # columns (behind bone or air) contribute nothing visible and must not shift it
+        A_row = (A * att_int).sum(1) / att_int.sum(1).clamp(min=1e-12)
         lam_row = spec.c * 1e-3 / self._interp(A_lut, fbar_lut, A_row)           # mm, local mean wavelength
         sig_z_row = spec.c * 1e-3 / (2 * np.pi * self._interp(A_lut, sf_lut, A_row)) / 2
 
@@ -439,19 +447,25 @@ class PreviewRenderer:
         rows_z, rows_x = sig_z_row / dz, sig_x_row
         uz, ux = torch.unique(torch.round(rows_z * 20) / 20), torch.unique(torch.round(rows_x * 20) / 20)
         energy = ref / (self._interp_vals(uz, k2sum(uz), rows_z) * self._interp_vals(ux, k2sum(ux), rows_x))
-        # a perpendicular boundary with reflection R peaks at specular * R speckle-rms units
-        rf = speckle + (p.specular * np.sqrt(ref) / float(kz0.max())) * spec_echo / energy.sqrt()[:, None]
-        parts = []
-        for comp in (rf.real, rf.imag):
-            comp = _banded_conv(comp, sig_z_row / dz, 0)                          # axial, sigma per depth
-            parts.append(_banded_conv(comp, sig_x_row, 1))                        # lateral, sigma per row
         # transmitted intensity averaged over the two-way lateral beam (partial shadows)
         att_int = _banded_conv(att_int, sig_x_row, 1)
         if p.shadow_blur_mm > 0:                                                  # optional extra fill-in
             att_int = _conv_along(att_int, _gauss_kernel(p.shadow_blur_mm / dx, dev), 1)
-        env2 = (parts[0] ** 2 + parts[1] ** 2) * energy[:, None] * att_int       # intensity (nz, nx)
+        # a perpendicular boundary with reflection R peaks at specular * R speckle-rms units;
+        # every echo is attenuated along its own path before it is blurred by the PSF, so a
+        # bright reflector in front of a sudden loss (bone, air) keeps its full peak
+        rf = speckle + (p.specular * np.sqrt(ref) / float(kz0.max())) * spec_echo / energy.sqrt()[:, None]
+        rf = rf * att_int.sqrt()
+        parts = []
+        for comp in (rf.real, rf.imag):
+            comp = _banded_conv(comp, sig_z_row / dz, 0)                          # axial, sigma per depth
+            parts.append(_banded_conv(comp, sig_x_row, 1))                        # lateral, sigma per row
+        env2 = (parts[0] ** 2 + parts[1] ** 2) * energy[:, None]                 # intensity (nz, nx)
 
-        # display depth: the scanner maps time to depth with c0
+        # display depth: the scanner maps time to depth with c0. Bone and air interiors are
+        # anechoic and sit behind total shadows, so their extreme speeds are clamped to the
+        # soft-tissue range rather than stretching or squashing the display
+        c_c = c_c.clamp(1300.0, 1800.0)
         z_app = torch.cumsum(C0 / c_c * dz, 0) - 0.5 * dz * C0 / c_c[:1]          # (nz, nx), monotonic
         n_app = int(round(p.depth_mm / dz))
         targets = ((torch.arange(n_app, device=dev, dtype=torch.float32) + 0.5) * dz)
@@ -469,13 +483,22 @@ class PreviewRenderer:
         # (area-averaging intensity would smooth the speckle and break its statistics)
         out_h = max(2, int(round(p.depth_mm / p.px_z_mm)))
         out_w = max(2, int(round(width / p.px_x_mm)))
-        env2 = _resize_axis(_resize_axis(env2.sqrt(), out_h, 0, "linear"), out_w, 1, "linear") ** 2
+        amp = env2.sqrt()
+        # anti-alias before decimating: thin bright reflectors (bone, pleura, fascia) are
+        # narrower than an output pixel and would otherwise be skipped at random
+        for dim, n_out in ((0, out_h), (1, out_w)):
+            ratio = amp.shape[dim] / n_out
+            if ratio > 2.0:
+                amp = _conv_along(amp, _gauss_kernel(0.42 * ratio, dev), dim)
+        env2 = _resize_axis(_resize_axis(amp, out_h, 0, "linear"), out_w, 1, "linear") ** 2
         lab_o = _resize_axis(_resize_axis(lab_c.float(), out_h, 0, "nearest"), out_w, 1, "nearest").long()
         self.last_intensity = env2       # linear echo intensity before compression (validation)
-        db = 10 * torch.log10(env2 / ref + 1e-12)
         if p.speckle_reduction > 0:
+            # vendor-style speckle smoothing on the amplitude (not on dB, where averaging a thin
+            # bright reflector with the black shadow behind it would erase the reflector)
             ks = _gauss_kernel(p.speckle_reduction, dev)
-            db = _conv_along(_conv_along(db, ks, 0), ks, 1)
+            env2 = _conv_along(_conv_along(env2.sqrt(), ks, 0), ks, 1) ** 2
+        db = 10 * torch.log10(env2 / ref + 1e-12)
         img = torch.clamp((db + p.gain_db) / p.dynamic_range_db + 1, 0, 1)
         rgb = (img[..., None] * 255).expand(-1, -1, 3).clone()
 

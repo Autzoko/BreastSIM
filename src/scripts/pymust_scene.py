@@ -51,7 +51,8 @@ def scene_scatterers(vol, pose, spec, depth, slab_mm, keep_frac=1.0, conform=Tru
     z = zr - np.interp(x, xs, offs)                                        # depth along its own line
     keep = (np.abs(x) < width / 2 + 2) & (z > 0) & (z < depth) & (np.abs(y) <= slab_mm)
     x, y, z, pos, amp = x[keep], y[keep], z[keep], pos[keep], amp[keep]
-    iv = np.clip(np.round(pos / vol.voxel_mm).astype(int), 0, np.array(vol.label.shape) - 1)
+    a0 = np.array([vol.a0_mm, 0.0, 0.0])
+    iv = np.clip(np.round((pos - a0) / vol.voxel_mm).astype(int), 0, np.array(vol.label.shape) - 1)
     lab = vol.label[iv[:, 0], iv[:, 1], iv[:, 2]]
     echo = tissue.lut(tissue.ECHOGENICITY)[lab]
     # heterogeneous attenuation: integrate alpha along each scatterer's line (0.1 mm steps)
@@ -61,7 +62,7 @@ def scene_scatterers(vol, pose, spec, depth, slab_mm, keep_frac=1.0, conform=Tru
     for xc in np.unique(xq):
         m = xq == xc
         line = origin + xc * lat + (steps[:, None] + np.interp(xc, xs, offs)) * ax
-        li = np.clip(np.round(line / vol.voxel_mm).astype(int), 0, np.array(vol.label.shape) - 1)
+        li = np.clip(np.round((line - a0) / vol.voxel_mm).astype(int), 0, np.array(vol.label.shape) - 1)
         cum = np.cumsum(vol.alpha[li[:, 0], li[:, 1], li[:, 2]].astype(np.float64)) * 0.1e-3
         A[m] = np.interp(z[m], steps, cum)
     Ag, E, _, _ = spectral_attenuation_lut(spec, vol.alpha_power)

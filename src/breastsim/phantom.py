@@ -53,6 +53,7 @@ class Volume:
     meta: dict = field(default_factory=dict)
     c: np.ndarray = None              # speed of sound, m/s (float16)
     lesion_id: np.ndarray = None      # uint8, lesion index + 1 inside lesions, 0 elsewhere
+    a0_mm: float = 0.0                # A coordinate of voxel index 0 (negative once a chest wall is added)
 
     @property
     def extent_mm(self):
@@ -380,14 +381,67 @@ def ensure_cache(pid, log=print):
             build_cache(pid, log)
 
 
-def load(pid, log=print):
+def load(pid, log=print, chest_wall=True):
     d = cache_dir(pid)
     ensure_cache(pid, log)
     meta = json.loads((d / "meta.json").read_text())
     lesion_acoustics(pid, meta["lesions"])
-    return Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
-                  meta["voxel_mm"], meta["alpha_power"], np.load(d / "surface.npy"),
-                  np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"), np.load(d / "lesion_id.npy"))
+    vol = Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
+                 meta["voxel_mm"], meta["alpha_power"], np.load(d / "surface.npy"),
+                 np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"), np.load(d / "lesion_id.npy"))
+    return add_chest_wall(vol) if chest_wall else vol
+
+
+def add_chest_wall(vol, depth_mm=25.0):
+    """Prepend a procedural chest wall behind the breast (A < 0): pectoral fascia,
+    pectoralis major with perimysial septa (8-12.5 mm, varying smoothly), deep
+    fascia, ribs (elliptic, 12 x 8 mm, every ~24 mm along u, running along v)
+    with intercostal muscle, and aerated lung behind the pleura.
+
+    The source phantoms have no chest wall (VICTRE relabels muscle), but it is
+    visible at the bottom of most clinical breast images. Geometry is
+    deterministic per phantom; parameters are stored in vol.meta["chest_wall"].
+    Coordinates are unchanged (A = 0 stays the chest-wall plane).
+    """
+    import zlib
+    rng = np.random.default_rng(zlib.crc32(f"{vol.id}#chest".encode()))
+    vox = vol.voxel_mm
+    pad = int(round(depth_mm / vox))
+    U, V = vol.label.shape[1:]
+    d = ((pad - np.arange(pad)) * vox)[:, None, None]                    # depth below the chest-wall plane
+    u = (np.arange(U) * vox)[None, :, None]
+    v = (np.arange(V) * vox)[None, None, :]
+    ph = rng.uniform(0, 2 * np.pi, 4)
+    t_mus = 10.25 + 2.25 * np.sin(2 * np.pi * u / 80 + ph[0]) * np.cos(2 * np.pi * v / 90 + ph[1])
+    stri = d + 1.5 * np.sin(2 * np.pi * u / 30 + ph[2]) + 0.25 * (u + v) * np.tan(0.35)   # oblique fibres
+    label = np.full((pad, U, V), tissue.MUSCLE, np.uint8)
+    label[(np.mod(stri, 2.0) < 0.2) & (d < t_mus)] = tissue.FASCIA
+    label[np.broadcast_to(d < 0.4, label.shape)] = tissue.FASCIA
+    deep = d - t_mus                                                     # depth below the muscle
+    label[(deep >= 0) & (deep < 0.4)] = tissue.FASCIA
+    rib_top, rib_hw, rib_hh, pitch = 0.4, 6.0, 4.0, 24.0
+    u0 = rng.uniform(0, pitch)
+    rib_u = np.arange(u0 - pitch, U * vox + pitch, pitch)
+    du = np.min(np.abs(u[..., None] - rib_u), axis=-1)                    # distance to nearest rib axis
+    in_rib = (du / rib_hw) ** 2 + ((deep - rib_top - rib_hh) / rib_hh) ** 2 < 1
+    label[in_rib] = tissue.RIB
+    label[(deep >= rib_top + 2 * rib_hh + 0.5) & ~in_rib] = tissue.LUNG   # pleura just below the ribs
+    c, rho, a = (tissue.lut({k: v_[i] for k, v_ in tissue.DEFAULT_ACOUSTIC.items()}, default=np.nan)
+                 for i in range(3))
+    cat = lambda pre, arr: np.concatenate([pre.astype(arr.dtype), arr], axis=0)
+    vol.label = cat(label, vol.label)
+    vol.z = cat(c[label] * rho[label] / 1e6, vol.z)
+    vol.alpha = cat(a[label], vol.alpha)
+    if vol.c is not None:
+        vol.c = cat(c[label], vol.c)
+    if vol.lesion_id is not None:
+        vol.lesion_id = cat(np.zeros(label.shape, np.uint8), vol.lesion_id)
+    vol.a0_mm -= pad * vox
+    vol.meta["chest_wall"] = {"depth_mm": pad * vox, "muscle_mm": [8.0, 12.5], "rib_u_mm": rib_u.tolist(),
+                              "rib_half_width_mm": rib_hw, "rib_half_height_mm": rib_hh,
+                              "rib_center_below_muscle_mm": rib_top + rib_hh,
+                              "muscle_mean_mm": 10.25, "pleura_below_muscle_mm": rib_top + 2 * rib_hh + 0.5}
+    return vol
 
 
 def load_meshes(pid):
