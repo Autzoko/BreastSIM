@@ -84,6 +84,29 @@ def main():
         report["click_moved_probe"] = (pose0["u"], pose0["v"]) != (pose1["u"], pose1["v"])
 
         time.sleep(1.5)
+
+        # clinical readouts and ground-truth view
+        report["position_readout"] = page.inner_text("#readouts div:first-child span")
+        report["legend"] = page.inner_text("#legend")
+        if "cm FN" not in report["position_readout"] and "SA" not in report["position_readout"]:
+            errors.append(f"position readout: {report['position_readout']!r}")
+        if "fat" not in report["legend"]:
+            errors.append(f"ground-truth legend: {report['legend']!r}")
+
+        # switching phantoms (to another cached one, then back)
+        cached = [p["id"] for p in page.evaluate("() => fetch('/api/phantoms').then(r => r.json())")
+                  if p["cached"] and p["id"] != args.phantom]
+        if cached:
+            for pid in (cached[0], args.phantom):
+                t0 = time.time()
+                page.select_option("#phantom", pid)
+                page.wait_for_function(
+                    f"() => window.__breastsim.info && window.__breastsim.info.id === '{pid}' && "
+                    f"window.__breastsim.lastMeta && window.__breastsim.lastMeta.phantom === '{pid}' && "
+                    "document.getElementById('loading').hidden", timeout=120_000)
+                report.setdefault("switch_s", {})[pid] = round(time.time() - t0, 1)
+        else:
+            report["switch_s"] = "skipped: no second cached phantom"
         report["fps_readout"] = page.inner_text("#perf").split(" fps")[0]
         page.screenshot(path=args.out)
         browser.close()
