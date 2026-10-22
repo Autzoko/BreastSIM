@@ -30,7 +30,7 @@ else
 fi
 
 if [[ "$BREASTSIM_HOST" == local ]]; then
-    BREASTSIM_PY=("$CONDA_BIN" run -n "$BREASTSIM_ENV" python)
+    BREASTSIM_PY=("$CONDA_BIN" run --no-capture-output -n "$BREASTSIM_ENV" python)
 else
     BREASTSIM_PY=("$BREASTSIM_ENV/bin/python")
 fi

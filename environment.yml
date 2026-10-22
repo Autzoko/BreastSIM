@@ -20,5 +20,6 @@ dependencies:
       - fastapi
       - uvicorn[standard]
       - playwright          # e2e UI check (src/scripts/e2e_check.py)
+      - pywebview           # native Probe Lab window (src/scripts/probe_lab_app.py)
 # PyMUST is installed editable from lib/PyMUST, and PyTorch per platform,
 # by src/scripts/setup_env.sh.
