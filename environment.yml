@@ -8,6 +8,11 @@ dependencies:
   - matplotlib
   - h5py
   - aria2
+  - pandas
+  - openpyxl
+  - scikit-image
+  - pytest
+  - httpx
   - ipykernel
   - pip
   - pip:

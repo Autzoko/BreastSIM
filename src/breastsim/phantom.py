@@ -22,6 +22,7 @@ import numpy as np
 from . import paths, tissue
 
 PREVIEW_VOXEL_MM = 0.2
+CACHE_VERSION = 2   # bump to rebuild caches after changing the conversion
 WATER_Z, WATER_ALPHA = 1.5, 0.025
 
 # Li et al. 2021, power-law exponent per BI-RADS type.
@@ -104,6 +105,25 @@ def _stride(a, k):
     return a[:s[0]:k, :s[1]:k, :s[2]:k]
 
 
+# Thin or small structures that must survive downsampling (later wins).
+PRIORITY_LABELS = (tissue.LIGAMENT, tissue.SKIN, tissue.EPIDERMIS, tissue.DUCT) + tissue.LESIONS
+
+
+def _downsample_labels(a, k):
+    """Nearest-neighbour labels, except that thin structures (ligaments, skin)
+    and lesions win their block, so they are not lost at preview resolution."""
+    out = _stride(a, k).copy()
+    if k == 1:
+        return out
+    s = [n // k * k for n in a.shape]
+    blocks = a[:s[0], :s[1], :s[2]].reshape(s[0] // k, k, s[1] // k, k, s[2] // k, k)
+    for lab in PRIORITY_LABELS:
+        hit = (blocks == lab).any(axis=(1, 3, 5))
+        if hit.any():
+            out[hit] = lab
+    return out
+
+
 def _read(path, key):
     with h5py.File(path, "r") as h:
         return h[key][()]
@@ -113,7 +133,7 @@ def _load_usct(info):
     voxel = float(np.array(_read(info.files["label"].with_name(
         info.files["label"].name.replace("_label", "_info")), "voxel_size")).ravel()[0])
     k = _factor(voxel)
-    label = _stride(_read(info.files["label"], "label"), k)
+    label = _downsample_labels(_read(info.files["label"], "label"), k)
     c = _block_mean(_read(info.files["sos"], "sos"), k)
     z = c * _block_mean(_read(info.files["density"], "density"), k) / 1e6
     del c
@@ -126,7 +146,7 @@ def _load_oat64(info):
     with h5py.File(info.files["label"], "r") as h:
         voxel = float(np.array(h["voxel_size"]).ravel()[0])
         k = _factor(voxel)
-        label = _stride(h["label"][()], k)
+        label = _downsample_labels(h["label"][()], k)
         if "label_pa" in h:
             pa = _stride(h["label_pa"][()], k) > 0
             label[pa & ~np.isin(label, (tissue.TUMOR, tissue.NECROSIS))] = tissue.ANGIOGENESIS
@@ -201,6 +221,60 @@ def _surface(label, voxel):
     return surf
 
 
+def find_lesions(label, voxel, min_voxels=8):
+    """Connected lesion components: type, centroid (a, u, v) mm, size."""
+    from scipy import ndimage
+    mask = np.isin(label, tissue.LESIONS)
+    comps, n = ndimage.label(mask, structure=np.ones((3, 3, 3)))
+    out = []
+    for i, sl in enumerate(ndimage.find_objects(comps), 1):
+        sub = comps[sl] == i
+        nvox = int(sub.sum())
+        if nvox < min_voxels:
+            continue
+        idx = np.argwhere(sub) + [s.start for s in sl]
+        labs, cnt = np.unique(label[sl][sub], return_counts=True)
+        kinds = [tissue.NAMES[int(l)] for l in labs[np.argsort(-cnt)]]
+        vol_mm3 = nvox * voxel ** 3
+        out.append({
+            "id": len(out), "type": kinds[0], "parts": kinds,
+            "center_mm": [float(c) for c in idx.mean(0) * voxel],   # voxel i is centred at i * voxel
+            "bbox_mm": [[float(s.start * voxel), float(s.stop * voxel)] for s in sl],
+            "volume_mm3": round(vol_mm3, 1), "diameter_mm": round((6 * vol_mm3 / np.pi) ** (1 / 3), 2),
+        })
+    return out
+
+
+def _mesh(mask, voxel, factor, sigma=1.0):
+    """Smoothed marching-cubes surface; vertices in (a, u, v) mm."""
+    from scipy import ndimage
+    from skimage import measure
+    if factor > 1:
+        s = [n // factor * factor for n in mask.shape]
+        mask = mask[:s[0], :s[1], :s[2]].reshape(s[0] // factor, factor, s[1] // factor, factor,
+                                                  s[2] // factor, factor).mean(axis=(1, 3, 5))
+    f = ndimage.gaussian_filter(np.pad(mask.astype(np.float32), 1), sigma)
+    if f.max() < 0.5:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint32)
+    verts, faces, _, _ = measure.marching_cubes(f, 0.5)
+    verts = ((verts - 1) * factor + (factor - 1) / 2) * voxel
+    return verts.astype(np.float32), faces.astype(np.uint32)
+
+
+def build_meshes(label, voxel, lesions):
+    meshes = {}
+    meshes["skin"] = _mesh(label > 0, voxel, factor=4)
+    meshes["gland"] = _mesh(label == tissue.GLAND, voxel, factor=3, sigma=0.7)
+    for les in lesions:
+        (a0, a1), (u0, u1), (v0, v1) = [[int(x / voxel) for x in b] for b in les["bbox_mm"]]
+        pad = 2
+        lo = [max(0, a0 - pad), max(0, u0 - pad), max(0, v0 - pad)]
+        sub = np.isin(label[lo[0]:a1 + pad, lo[1]:u1 + pad, lo[2]:v1 + pad], tissue.LESIONS)
+        v, f = _mesh(sub, voxel, factor=1, sigma=0.6)
+        meshes[f"lesion{les['id']}"] = (v + np.array(lo, np.float32) * voxel, f)
+    return meshes
+
+
 # -------------------------------------------------------------------- cache
 def cache_dir(pid):
     return paths.CACHE / "preview" / pid.replace("/", "__")
@@ -214,26 +288,39 @@ def build_cache(pid, log=print):
     label, z, alpha, ori = canonicalize(label, z, alpha)
     out = cache_dir(pid)
     out.mkdir(parents=True, exist_ok=True)
+    (out / "meta.json").unlink(missing_ok=True)   # meta.json last = cache complete
     np.save(out / "label.npy", label)
     np.save(out / "z.npy", z.astype(np.float16))
     np.save(out / "alpha.npy", alpha.astype(np.float16))
     np.save(out / "surface.npy", _surface(label, voxel))
     np.save(out / "lesion_proj.npy", np.isin(label, tissue.LESIONS).any(axis=0))
+    log(f"[phantom] {pid}: finding lesions and meshing")
+    lesions = find_lesions(label, voxel)
+    meshes = build_meshes(label, voxel, lesions)
+    np.savez_compressed(out / "meshes.npz", **{f"{k}_{p}": a for k, va in meshes.items()
+                                                for p, a in zip(("verts", "faces"), va)})
     labels, counts = np.unique(label, return_counts=True)
-    meta = {"id": pid, "source": info.source, "description": info.description, "voxel_mm": voxel,
-            "alpha_power": power, "shape": list(label.shape), "orientation": ori,
+    meta = {"version": CACHE_VERSION, "id": pid, "source": info.source, "description": info.description,
+            "voxel_mm": voxel, "alpha_power": power, "shape": list(label.shape), "orientation": ori,
             "labels": {int(l): int(c) for l, c in zip(labels, counts)},
             "mean_z": {int(l): float(z[label == l].mean()) for l in labels},
             "mean_alpha": {int(l): float(alpha[label == l].mean()) for l in labels},
+            "lesions": lesions, "meshes": {k: [len(v[0]), len(v[1])] for k, v in meshes.items()},
             "built": time.strftime("%Y-%m-%d %H:%M:%S"), "build_seconds": round(time.time() - t0, 1)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
-    log(f"[phantom] {pid}: shape {label.shape} @ {voxel} mm in {meta['build_seconds']} s")
+    log(f"[phantom] {pid}: shape {label.shape} @ {voxel} mm, {len(lesions)} lesion(s), "
+        f"{meta['build_seconds']} s")
     return out
+
+
+def is_cached(pid):
+    f = cache_dir(pid) / "meta.json"
+    return f.exists() and json.loads(f.read_text()).get("version") == CACHE_VERSION
 
 
 def load(pid, log=print):
     d = cache_dir(pid)
-    if not (d / "meta.json").exists():
+    if not is_cached(pid):
         build_cache(pid, log)
     meta = json.loads((d / "meta.json").read_text())
     return Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
@@ -241,15 +328,22 @@ def load(pid, log=print):
                   np.load(d / "lesion_proj.npy"), meta)
 
 
+def load_meshes(pid):
+    """{name: (verts (N,3) a,u,v mm, faces (M,3))} from the cache."""
+    with np.load(cache_dir(pid) / "meshes.npz") as z:
+        names = sorted({k.rsplit("_", 1)[0] for k in z.files})
+        return {n: (z[f"{n}_verts"], z[f"{n}_faces"]) for n in names}
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="List phantoms / build preview caches")
     ap.add_argument("ids", nargs="*", help="phantom ids to cache (default: list)")
-    ap.add_argument("--all", action="store_true", help="cache every phantom")
+    ap.add_argument("--all", action="store_true", help="cache every phantom that is not cached yet")
     args = ap.parse_args()
-    ids = [p.id for p in list_phantoms()] if args.all else args.ids
+    ids = [p.id for p in list_phantoms() if not is_cached(p.id)] if args.all else args.ids
     if not ids:
         for p in list_phantoms():
-            print(f"{p.id:24s} {'cached' if (cache_dir(p.id) / 'meta.json').exists() else '      '}  {p.description}")
+            print(f"{p.id:24s} {'cached' if is_cached(p.id) else '      '}  {p.description}")
     for pid in ids:
         build_cache(pid)

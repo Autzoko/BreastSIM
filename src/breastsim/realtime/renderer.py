@@ -2,6 +2,8 @@
 
 Approximate but content-consistent with the high-fidelity generator:
 - anatomy, impedance and attenuation come from the same canonical phantom;
+- the image plane comes from probe.ProbePose.frame / probe.skin_offsets
+  (optionally pressing the skin flat under the probe);
 - speckle comes from the shared deterministic scatterer lattice
   (breastsim.scatter), with phase from each scatterer's true depth, and is
   integrated over the elevation beam, so neighbouring frames decorrelate
@@ -9,7 +11,9 @@ Approximate but content-consistent with the high-fidelity generator:
 - imaging is a separable Gaussian PSF (axial from the pulse bandwidth,
   lateral widening with depth) instead of a field simulation;
 - specular echoes come from axial impedance changes, shadowing /
-  enhancement from the cumulative attenuation along each line.
+  enhancement from the cumulative attenuation along each line;
+- output is resampled to the preset's pixel spacing, with optional
+  vendor-style speckle reduction.
 """
 import time
 import zlib
@@ -20,23 +24,36 @@ import torch
 import torch.nn.functional as F
 
 from .. import scatter, tissue
-from ..probe import PROBES, ProbePose
+from ..presets import DEFAULT_PRESET, PRESETS
+from ..probe import PROBES, ProbePose, skin_offsets
 
 NP_PER_DB = 1 / 8.686
 
 
 @dataclass
 class ImagingParams:
-    probe: str = "L11-5v"
-    depth_mm: float = 40.0
-    gain_db: float = -12.0
-    dynamic_range_db: float = 55.0
+    probe: str = "L12-hf"
+    depth_mm: float = 42.0
+    px_x_mm: float = 0.078            # output pixel spacing along the array
+    px_z_mm: float = 0.078            # output pixel spacing in depth
+    gain_db: float = -13.0
+    dynamic_range_db: float = 52.0
     tgc_db_cm_mhz: float = 0.5        # depth gain compensation
     specular: float = 12.0            # weight of impedance-boundary echoes
     lateral_f_number: float = 2.0     # minimum receive F-number
+    speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
+    conform: bool = True              # probe presses the skin flat
     overlay: str = "contour"          # none | contour | labels
     elevation_samples: int = 16
-    seed: int = 0
+    preset: str = DEFAULT_PRESET
+
+    @classmethod
+    def from_preset(cls, name, **overrides):
+        p = PRESETS[name]
+        fields = {k: getattr(p, k) for k in ("probe", "depth_mm", "px_x_mm", "px_z_mm", "gain_db",
+                                             "dynamic_range_db", "speckle_reduction",
+                                             "lateral_f_number", "conform")}
+        return cls(**{**fields, "preset": name, **overrides})
 
 
 def _gauss_kernel(sigma_px, device):
@@ -46,9 +63,16 @@ def _gauss_kernel(sigma_px, device):
     return k / k.sum()
 
 
+def _conv_along(x, k, dim):
+    """Real 1D convolution of a 2D tensor along dim, replicate padding."""
+    x = x.movedim(dim, -1)
+    shape = x.shape
+    y = F.conv1d(F.pad(x.reshape(-1, 1, shape[-1]), (len(k) // 2,) * 2, mode="replicate"), k[None, None])
+    return y.reshape(shape).movedim(-1, dim)
+
+
 class PreviewRenderer:
-    DX_MM = 0.1     # lateral sampling
-    DZ_MM = 0.05    # axial sampling (output is pooled to 0.1 mm)
+    DZ_MM = 0.05    # internal axial sampling
 
     def __init__(self, device=None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -62,9 +86,8 @@ class PreviewRenderer:
 
     # ------------------------------------------------------------- volume
     def set_volume(self, vol):
-        self.vol = vol
-        self._labels = None
-        self._props = None
+        self.vol = None
+        self._labels = self._props = None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device, torch.float32)
@@ -73,32 +96,38 @@ class PreviewRenderer:
         self._norm = torch.tensor([(n - 1) * vol.voxel_mm / 2 for n in vol.label.shape],
                                   device=self.device, dtype=torch.float32)
         self.seed = zlib.crc32(vol.id.encode()) % 100_000  # stable across processes
+        self.vol = vol
 
     def _sample(self, volume, pts, mode):
-        """pts (..., 3) mm in (a, u, v) -> (C, ...) values."""
+        """pts (..., 3) mm in (a, u, v) -> (C, ...) values (border-clamped)."""
         shape = pts.shape[:-1]
-        g = pts.reshape(1, 1, 1, -1, 3) / self._norm - 1
-        g = g.flip(-1)  # grid_sample wants (x=v, y=u, z=a)
+        g = (pts.reshape(1, 1, 1, -1, 3) / self._norm - 1).flip(-1)  # grid_sample order (v, u, a)
         out = F.grid_sample(volume, g, mode=mode, padding_mode="border", align_corners=True)
         return out.reshape(volume.shape[1], *shape)
 
     # ------------------------------------------------------------- render
     @torch.no_grad()
     def render(self, pose: ProbePose, p: ImagingParams):
+        """Returns (rgb uint8 (H, W, 3), meta dict, lesion mask bool (H, W))."""
         t0 = time.perf_counter()
         vol, dev = self.vol, self.device
         spec = PROBES[p.probe]
         lam = spec.wavelength * 1e3                     # mm
         width, h_el, zf = spec.aperture * 1e3, spec.height * 1e3, spec.elev_focus * 1e3
-        nx = int(round(width / self.DX_MM)) + 1
-        nz = int(round(p.depth_mm / self.DZ_MM)) // 2 * 2
+        dx = float(np.clip(p.px_x_mm, 0.1, 0.2))        # internal lateral sampling
+        nx = int(round(width / dx)) + 1
+        nz = int(round(p.depth_mm / self.DZ_MM))
         x = torch.linspace(-width / 2, width / 2, nx, device=dev)
         z = (torch.arange(nz, device=dev, dtype=torch.float32) + 0.5) * self.DZ_MM
 
-        origin, axes = pose.frame(vol.surface, vol.voxel_mm, spec)
-        origin = torch.tensor(origin, device=dev, dtype=torch.float32)
-        e_lat, e_ax, e_el = torch.tensor(axes, device=dev, dtype=torch.float32)
-        plane = origin + x[None, :, None] * e_lat + z[:, None, None] * e_ax     # (nz, nx, 3)
+        origin_np, axes_np = pose.frame(vol.surface, vol.voxel_mm, spec)
+        offs_np = skin_offsets(vol.surface, vol.voxel_mm, origin_np, axes_np, x.cpu().numpy(),
+                               conform=p.conform, standoff=pose.standoff)
+        offs = torch.from_numpy(offs_np).to(dev)
+        origin = torch.tensor(origin_np, device=dev, dtype=torch.float32)
+        e_lat, e_ax, e_el = torch.tensor(axes_np, device=dev, dtype=torch.float32)
+        zt = z[:, None] + offs[None]                                              # depth along each line
+        plane = origin + x[None, :, None] * e_lat + zt[..., None] * e_ax          # (nz, nx, 3)
 
         # two-way elevation beam width (diffraction at focus, geometric off focus)
         fwhm_y = torch.sqrt((lam * zf / h_el) ** 2 + (h_el * (1 - z / zf)) ** 2) / np.sqrt(2)
@@ -110,12 +139,13 @@ class PreviewRenderer:
         ts = torch.linspace(-2.5, 2.5, p.elevation_samples, device=dev)
         ws = torch.exp(-0.5 * ts ** 2)
         d = 2  # samples, impedance difference half-span (0.1 mm)
+        line_start = (origin @ e_ax) + offs                                       # per-line phase reference
         for t, w in zip(ts, ws):
             pts = plane + (t * sig_y)[..., None] * e_el
             lab = self._sample(self._labels, pts, "nearest")[0]
             imp = self._sample(self._props[:, :1], pts, "bilinear")[0]
             amp, pos = scatter.cells(pts, seed=self.seed)
-            depth = (pos - origin) @ e_ax
+            depth = pos @ e_ax - line_start[None]
             echo = self.echo_lut[lab.long()] * amp
             speckle += w * echo * torch.polar(torch.ones_like(depth), k2 * depth)
             zp = torch.cat([imp[d:], imp[-1:].expand(d, -1)])
@@ -133,49 +163,63 @@ class PreviewRenderer:
         tgc_np = p.tgc_db_cm_mhz * 100 * NP_PER_DB * f_mhz * z[:, None] * 1e-3
         gain = torch.exp(2 * (tgc_np - att_np))
 
-        # separable PSF: axial from bandwidth, lateral widening with depth
+        # separable PSF: axial from the bandwidth, lateral widening with depth
         sig_f = spec.bandwidth * spec.fc / 2.355                                 # Hz
-        sig_z = spec.c / (2 * np.pi * sig_f) / 2 * 1e3                            # mm
+        sig_z = spec.c / (2 * np.pi * sig_f) / 2 * 1e3                            # mm, two-way
         kz = _gauss_kernel(sig_z / self.DZ_MM, dev)
-        ri = torch.view_as_real(rf).permute(2, 1, 0).reshape(2 * nx, 1, nz)      # lines along z
-        ri = F.conv1d(F.pad(ri, (len(kz) // 2,) * 2, mode="replicate"), kz[None, None])
-        rf = torch.view_as_complex(ri.reshape(2, nx, nz).permute(2, 1, 0).contiguous())
+        rf = torch.complex(_conv_along(rf.real, kz, 0), _conv_along(rf.imag, kz, 0))
         fwhm_x = lam * torch.clamp(z / width, min=p.lateral_f_number)
-        sig_x = fwhm_x / 2.355 / self.DX_MM
+        sig_x = fwhm_x / 2.355 / dx                                               # px, per row
         bands = torch.linspace(float(sig_x.min()), float(sig_x.max()), 5, device=dev)
-        rows = torch.view_as_real(rf).permute(0, 2, 1).reshape(2 * nz, 1, nx)
         outs = []
         for s in bands:
             k = _gauss_kernel(float(s), dev)
-            outs.append(F.conv1d(F.pad(rows, (len(k) // 2,) * 2, mode="replicate"), k[None, None]))
-        outs = torch.stack(outs).reshape(len(bands), nz, 2, nx)
-        pos = torch.clamp((sig_x - bands[0]) / max(float(bands[1] - bands[0]), 1e-6), 0, len(bands) - 1 - 1e-4)
-        i0 = pos.long()
-        frac = (pos - i0)[:, None, None]
-        rr = torch.arange(nz, device=dev)
-        lat = outs[i0, rr] * (1 - frac) + outs[i0 + 1, rr] * frac if len(bands) > 1 else outs[0]
-        env = torch.sqrt((lat ** 2).sum(1)) * gain                                # (nz, nx)
+            outs.append(torch.stack([_conv_along(rf.real, k, 1), _conv_along(rf.imag, k, 1)]))
+        outs = torch.stack(outs)                                                  # (B, 2, nz, nx)
+        step = float(bands[1] - bands[0])
+        if step < 1e-6:
+            lat = outs[0]
+        else:  # per row, interpolate between the two nearest bands
+            pos = torch.clamp((sig_x - bands[0]) / step, 0, len(bands) - 1 - 1e-4)
+            i0 = pos.long()
+            frac = (pos - i0)[:, None, None]
+            rr = torch.arange(nz, device=dev)
+            lat = (outs[i0, :, rr] * (1 - frac) + outs[i0 + 1, :, rr] * frac).permute(1, 0, 2)
+        env2 = (lat ** 2).sum(0) * gain ** 2                                      # intensity (nz, nx)
 
-        # reference: rms of unit-variance white noise through the PSF
-        ref = float(torch.sqrt((kz ** 2).sum() * (_gauss_kernel(float(sig_x.median()), dev) ** 2).sum()))
-        env = torch.sqrt(F.avg_pool2d((env ** 2)[None, None], (2, 1))[0, 0])      # 0.1 mm square pixels
-        db = 20 * torch.log10(env / ref + 1e-6)
+        # resample to the preset pixel grid (area-average intensity when shrinking)
+        out_h = max(2, int(round(nz * self.DZ_MM / p.px_z_mm)))
+        out_w = max(2, int(round(width / p.px_x_mm)))
+        mode = "area" if out_h <= nz and out_w <= nx else "bilinear"
+        env2 = F.interpolate(env2[None, None], size=(out_h, out_w), mode=mode)[0, 0]
+        ref = float((kz ** 2).sum() * (_gauss_kernel(float(sig_x.median()), dev) ** 2).sum())
+        db = 10 * torch.log10(env2 / ref + 1e-12)
+        if p.speckle_reduction > 0:
+            ks = _gauss_kernel(p.speckle_reduction, dev)
+            db = _conv_along(_conv_along(db, ks, 0), ks, 1)
         img = torch.clamp((db + p.gain_db) / p.dynamic_range_db + 1, 0, 1)
         rgb = (img[..., None] * 255).expand(-1, -1, 3).clone()
 
-        lab_c = lab_c[::2]
-        mask = self.lesion_lut[lab_c]
+        lab_o = F.interpolate(lab_c[None, None].float(), size=(out_h, out_w), mode="nearest")[0, 0].long()
+        mask = self.lesion_lut[lab_o]
         if p.overlay == "labels":
-            rgb = 0.6 * rgb + 0.4 * self.color_lut[lab_c].float()
+            rgb = 0.6 * rgb + 0.4 * self.color_lut[lab_o].float()
         elif p.overlay == "contour" and mask.any():
             m = mask.float()[None, None]
-            edge = (F.max_pool2d(m, 3, 1, 1) - (-F.max_pool2d(-m, 3, 1, 1)))[0, 0] > 0
+            edge = (F.max_pool2d(m, 3, 1, 1) + F.max_pool2d(-m, 3, 1, 1))[0, 0] > 0   # dilate - erode
             rgb[edge] = torch.tensor([60.0, 255.0, 60.0], device=dev)
         out = rgb.clamp(0, 255).to(torch.uint8).cpu().numpy()
+        px_x, px_z = width / out_w, nz * self.DZ_MM / out_h
+        lesion_types = sorted({tissue.NAMES[int(v)] for v in lab_o[mask].unique().tolist()}) if mask.any() else []
         if dev.type == "cuda":
             torch.cuda.synchronize()
-        return out, {
-            "face_a_mm": float(origin[0]), "pixel_mm": 2 * self.DZ_MM, "width_mm": width,
-            "depth_mm": nz * self.DZ_MM, "lesion_pixels": int(mask.sum()),
+        meta = {
+            "origin_mm": origin_np.tolist(), "axes": axes_np.tolist(), "face_a_mm": float(origin_np[0]),
+            "width_mm": width, "depth_mm": nz * self.DZ_MM, "px_x_mm": px_x, "px_z_mm": px_z,
+            "skin_offset_mm": [float(offs_np.min()), float(offs_np.max())],
+            # line start offsets at 33 positions across the array, for drawing the scan plane
+            "plane_offsets_mm": offs_np[np.linspace(0, nx - 1, 33).round().astype(int)].tolist(),
+            "lesion_area_mm2": round(float(mask.sum()) * px_x * px_z, 2), "lesion_types": lesion_types,
             "render_ms": round((time.perf_counter() - t0) * 1e3, 1),
         }
+        return out, meta, mask.cpu().numpy()

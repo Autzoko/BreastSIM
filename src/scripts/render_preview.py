@@ -30,17 +30,19 @@ def main():
     ap.add_argument("--sweep", type=int, default=1, help="frames along elevation")
     ap.add_argument("--step", type=float, default=0.5, help="sweep step, mm")
     ap.add_argument("--overlay", default="contour")
+    ap.add_argument("--preset", default="breast", help="scan preset (see breastsim.presets)")
     args = ap.parse_args()
 
     vol = phantom.load(args.phantom)
     r = PreviewRenderer()
     r.set_volume(vol)
-    u, v = lesion_center(vol)
-    params = ImagingParams(overlay=args.overlay)
+    les = vol.meta.get("lesions", [])
+    u, v = les[0]["center_mm"][1:] if les else lesion_center(vol)
+    params = ImagingParams.from_preset(args.preset, overlay=args.overlay)
     frames, times = [], []
     for k in range(args.sweep):
         pose = ProbePose(u=u, v=v + (k - args.sweep // 2) * args.step, rotation=args.rotation)
-        img, meta = r.render(pose, params)
+        img, meta, _ = r.render(pose, params)
         frames.append(img)
         times.append(meta["render_ms"])
     for _ in range(5):  # warm timing
@@ -48,7 +50,8 @@ def main():
         r.render(pose, params)
         times.append((time.perf_counter() - t0) * 1e3)
     Image.fromarray(np.concatenate(frames, axis=1)).save(args.out)
-    print(f"{args.phantom} pose u={u:.1f} v={v:.1f} mm | {meta} | warm render {np.median(times[-5:]):.1f} ms"
+    meta = {k: meta[k] for k in ("face_a_mm", "px_x_mm", "px_z_mm", "lesion_area_mm2", "lesion_types")}
+    print(f"{args.phantom} [{args.preset}] pose u={u:.1f} v={v:.1f} mm | {meta} | warm render {np.median(times[-5:]):.1f} ms"
           f" on {r.device} -> {args.out}")
 
 

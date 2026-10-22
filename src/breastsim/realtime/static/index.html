@@ -3,40 +3,60 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BreastSIM Preview</title>
+<title>BreastSIM Probe Lab</title>
 <link rel="stylesheet" href="/static/style.css">
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
 </head>
 <body>
 <header>
-  <strong>BreastSIM</strong> <span class="muted">real-time preview</span>
+  <strong class="brand">BreastSIM</strong><span class="muted">Probe Lab</span>
+  <label>Phantom <select id="phantom"></select></label>
+  <label>Scan preset <select id="preset"></select></label>
   <span id="status" class="muted">connecting…</span>
 </header>
 <main>
-  <section id="view">
-    <canvas id="bmode" width="384" height="400"></canvas>
-    <div id="readout" class="muted mono"></div>
-  </section>
-  <aside>
-    <div class="group">
-      <label>Phantom <select id="phantom"></select></label>
-      <div id="pdesc" class="muted small"></div>
-      <canvas id="overview" width="260" height="260" title="click: place probe · wheel: rotate"></canvas>
+  <section id="stage" class="card">
+    <div id="scene3d"></div>
+    <div class="toolbar">
+      <label><input type="checkbox" id="showSkin" checked> Skin</label>
+      <label><input type="checkbox" id="showGland"> Gland</label>
+      <label><input type="checkbox" id="showLesions" checked> Lesions</label>
+      <label><input type="checkbox" id="showPlane" checked> Scan plane</label>
+      <label class="op">Skin opacity <input type="range" id="skinOpacity" min="0.05" max="1" step="0.05" value="0.25"></label>
+      <button id="recenter">Recenter</button>
     </div>
-    <div class="group" id="pose"></div>
-    <div class="group" id="imaging"></div>
-    <div class="group row">
+    <div class="hint muted small">click skin: place probe · drag: orbit · right-drag: pan · wheel: zoom</div>
+  </section>
+  <section id="imagePane">
+    <div class="card">
+      <canvas id="bmode" width="480" height="540"></canvas>
+      <div id="readouts" class="readouts"></div>
+      <div id="perf" class="muted mono small"></div>
+    </div>
+    <div class="cols">
+      <div class="card">
+        <div class="cardtitle">Lesions</div>
+        <div id="lesions" class="small"></div>
+      </div>
+      <div class="card" id="pose"><div class="cardtitle">Probe</div></div>
+      <div class="card" id="imaging"><div class="cardtitle">Imaging</div></div>
+    </div>
+    <div class="card row">
       <label>Overlay <select id="overlay">
         <option value="contour">lesion contour</option>
         <option value="labels">tissue labels</option>
         <option value="none">none</option>
       </select></label>
       <button id="save">Save scene</button>
+      <span class="muted small">W/S elevation · A/D lateral · Q/E rotate · R/F tilt · Z/X rock · Shift ×5</span>
     </div>
-    <div class="muted small">
-      Keys: W/S elevation · A/D lateral · Q/E rotate · R/F tilt · Z/X rock · Shift ×5
-    </div>
-  </aside>
+  </section>
 </main>
-<script src="/static/app.js"></script>
+<script type="module" src="/static/app.js"></script>
 </body>
 </html>
