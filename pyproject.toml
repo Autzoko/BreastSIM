@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "breastsim"
+version = "0.0.1"
+description = "Breast ultrasound simulation platform: real-time preview and high-fidelity data generation"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["breastsim*"]

@@ -1,0 +1,44 @@
+# AI working notes (never committed)
+/_ai/
+
+# Downloaded open-source resources (fetched by src/scripts/fetch_data.py)
+/data/*
+!/data/README.md
+
+# Third-party dependencies (cloned by src/scripts/setup_lib.sh)
+/lib/*
+!/lib/README.md
+
+# Generated outputs / logs
+/outputs/
+/logs/
+*.log
+
+# Large data formats, in case any land outside data/
+*.mat
+*.h5
+*.hdf5
+*.zip
+*.npy
+*.npz
+*.nii
+*.nii.gz
+*.nrrd
+*.raw
+*.dat
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+envs/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

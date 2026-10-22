@@ -1,0 +1,17 @@
+name: breastsim
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - h5py
+  - ipykernel
+  - pip
+  - pip:
+      - k-wave-python
+      - fastapi
+      - uvicorn[standard]
+# PyMUST is installed editable from lib/PyMUST, and PyTorch per platform,
+# by src/scripts/setup_env.sh.
