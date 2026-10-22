@@ -15,6 +15,7 @@ curves away), plane-wave transmits at several angles, element signals recorded b
 delay-and-sum beamforming with c0 = 1540 m/s, coherent compounding, envelope, TGC, log.
 """
 import itertools
+import tempfile
 import time
 import zlib
 
@@ -216,10 +217,11 @@ def _kwave_run(c, rho, alpha, power, dx, cols, delays, apod, spec, t_end, cfl=0.
     src.p_mask = mask
     src.p = (apod[:, None] * np.exp(-0.5 * (tt / sig_t) ** 2) * np.sin(2 * np.pi * spec.fc * tt)).astype(np.float32)
     sensor = kSensor(mask=mask, record=["p"])
-    out = kspaceFirstOrder2D(kgrid, src, sensor, medium,
-                             SimulationOptions(pml_inside=False, pml_size=[_nice(nz), _nice(nx)], data_cast="single",
-                                               save_to_disk=True),
-                             SimulationExecutionOptions(is_gpu_simulation=gpu, show_sim_log=False))
+    with tempfile.TemporaryDirectory(prefix="breastsim_kwave_") as tmp:   # k-Wave leaves its h5 files behind
+        out = kspaceFirstOrder2D(kgrid, src, sensor, medium,
+                                 SimulationOptions(pml_inside=False, pml_size=[_nice(nz), _nice(nx)],
+                                                   data_cast="single", save_to_disk=True, data_path=tmp),
+                                 SimulationExecutionOptions(is_gpu_simulation=gpu, show_sim_log=False))
     p = np.asarray(out["p"] if isinstance(out, dict) else out)
     if p.shape[0] == len(t):
         p = p.T
@@ -350,10 +352,11 @@ def simulate(maps, spec, angles_deg=(-8, -4, 0, 4, 8), cfl=0.3, gpu=True, log=pr
         sensor = kSensor(mask=mask, record=["p"])
         t0 = time.time()
         kgrid, medium = grid_and_medium()
-        out = kspaceFirstOrder2D(kgrid, src, sensor, medium,
-                                 SimulationOptions(pml_inside=False, pml_size=list(pml), data_cast="single",
-                                                   save_to_disk=True),
-                                 SimulationExecutionOptions(is_gpu_simulation=gpu, show_sim_log=False))
+        with tempfile.TemporaryDirectory(prefix="breastsim_kwave_") as tmp:
+            out = kspaceFirstOrder2D(kgrid, src, sensor, medium,
+                                     SimulationOptions(pml_inside=False, pml_size=list(pml), data_cast="single",
+                                                       save_to_disk=True, data_path=tmp),
+                                     SimulationExecutionOptions(is_gpu_simulation=gpu, show_sim_log=False))
         p = np.asarray(out["p"] if isinstance(out, dict) else out)
         if p.shape[0] == len(t):                                    # (Nt, points) -> (points, Nt)
             p = p.T
