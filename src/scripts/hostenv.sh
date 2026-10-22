@@ -17,6 +17,8 @@ elif [[ -d /home/nyuair/data-001 ]]; then
     BREASTSIM_ENV=/home/nyuair/langtian/envs/breastsim
     BREASTSIM_BIG=/home/nyuair/data-001/langtian/BreastSIM
     CONDA_BIN=/home/nyuair/miniconda3/bin/conda
+    # The shared account's package cache has corrupted entries; use our own.
+    export CONDA_PKGS_DIRS=/home/nyuair/langtian/envs/.conda_pkgs
 elif [[ -d /scratch/ll5582 ]]; then
     BREASTSIM_HOST=jubail
     BREASTSIM_ENV=/scratch/ll5582/conda/envs/breastsim

@@ -11,6 +11,10 @@ else
     TARGET=(-p "$BREASTSIM_ENV")
 fi
 
+if [[ "$BREASTSIM_HOST" != local && -d "$BREASTSIM_ENV" && ! -x "$BREASTSIM_ENV/bin/python" ]]; then
+    echo "removing incomplete env $BREASTSIM_ENV"; rm -rf "$BREASTSIM_ENV"
+fi
+
 if "$CONDA_BIN" env list | grep -q "$BREASTSIM_ENV"; then
     "$CONDA_BIN" env update "${TARGET[@]}" -f environment.yml
 else
