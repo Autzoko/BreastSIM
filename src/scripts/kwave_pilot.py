@@ -78,6 +78,21 @@ def choose_poses(n, rng):
     return poses[:n]
 
 
+def poses_from_report(path):
+    """Reuse the poses of an earlier run (pose selection scans every skin voxel and is slow)."""
+    out = []
+    for r in json.loads(Path(path).read_text()):
+        pose = ProbePose(u=0.0, v=0.0, origin_mm=tuple(r["origin_mm"]), axes_rows=tuple(map(tuple, r["axes"])))
+        focus = r["depth"] / 2
+        if r["kind"].startswith("lesion #"):
+            les_id = int(r["kind"].split("#")[1].split()[0])
+            vol = phantom.load(r["pid"], chest_wall=False)
+            les = next(l for l in vol.meta["lesions"] if l["id"] == les_id)
+            focus = float((np.array(les["center_mm"]) - np.array(r["origin_mm"])) @ np.array(r["axes"][1]))
+        out.append(dict(pid=r["pid"], pose=pose, gap=r.get("gap", 0.0), kind=r["kind"], depth=r["depth"], focus=focus))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=10)
@@ -86,12 +101,13 @@ def main():
     ap.add_argument("--roughness", type=float, default=0.5, help="sub-voxel boundary jitter, source voxels")
     ap.add_argument("--only", default="", help="comma-separated image numbers to render (1-based)")
     ap.add_argument("--tx", choices=("focused", "plane"), default="focused")
+    ap.add_argument("--poses", default="", help="report.json of an earlier run to reuse its poses")
     ap.add_argument("--angles", default="-8,-4,0,4,8", help="plane-wave angles (deg) for --tx plane")
     ap.add_argument("--no-conform", action="store_true", help="flat probe face over the curved skin (water wedges)")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    poses = choose_poses(args.n, np.random.default_rng(0))
+    poses = poses_from_report(args.poses) if args.poses else choose_poses(args.n, np.random.default_rng(0))
     print(json.dumps([{k: v for k, v in p.items() if k != "pose"} for p in poses], indent=1), flush=True)
     r = PreviewRenderer()
     rows, report = [], []
