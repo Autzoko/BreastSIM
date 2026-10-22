@@ -14,6 +14,7 @@ Imaging: flat linear array at the probe face (water/gel above the skin where the
 curves away), plane-wave transmits at several angles, element signals recorded by k-Wave,
 delay-and-sum beamforming with c0 = 1540 m/s, coherent compounding, envelope, TGC, log.
 """
+import itertools
 import time
 import zlib
 
@@ -57,8 +58,33 @@ def _sample(dset, idx, order):
     return out.reshape(idx.shape[:-1])
 
 
-def plane_maps(pid, vol, pose, spec, depth_mm, dx_mm, lateral_margin_mm=1.0):
-    """Acoustic maps (rows = depth from the probe face, cols = lateral) on a dx grid."""
+def boundary_jitter(pts, seed, amp_mm, corr_mm=0.2):
+    """Smooth random displacement field (mm), a function of world position only.
+
+    Value noise on a corr_mm lattice, each component within +-amp_mm. Used to sample the
+    voxelised phantom with sub-voxel uncertainty: a published tissue boundary is only known to
+    within half a voxel, and an exactly planar staircase acts as a mirror at 10+ MHz, whereas
+    real interfaces are rough on the wavelength scale (Rayleigh criterion: rms > lambda/8)."""
+    import torch
+    p = torch.from_numpy(np.ascontiguousarray(pts.reshape(-1, 3)) / corr_mm)
+    i0 = torch.floor(p).to(torch.int64)
+    f = p - i0
+    f = f * f * (3 - 2 * f)
+    out = torch.zeros_like(p)
+    for corner in itertools.product((0, 1), repeat=3):
+        o = torch.tensor(corner)
+        w = torch.prod(torch.where(o.bool(), f, 1 - f), -1)
+        c = i0 + o
+        for d in range(3):
+            out[:, d] += w * (2 * scatter._uniform(scatter._hash(c[:, 0], c[:, 1], c[:, 2], seed, 101 + d)) - 1)
+    return (out.numpy() * amp_mm).reshape(pts.shape)
+
+
+def plane_maps(pid, vol, pose, spec, depth_mm, dx_mm, lateral_margin_mm=1.0, seed=0, roughness=0.5):
+    """Acoustic maps (rows = depth from the probe face, cols = lateral) on a dx grid.
+
+    roughness: maximum sub-voxel displacement of the sampling positions, in source voxels
+    (0 samples the voxel grid exactly)."""
     info = phantom.get_info(pid)
     if info.source != "oat64":
         raise NotImplementedError("full-resolution plane extraction is implemented for IDB-8164905 (oat64)")
@@ -71,6 +97,8 @@ def plane_maps(pid, vol, pose, spec, depth_mm, dx_mm, lateral_margin_mm=1.0):
     pts = origin + x[None, :, None] * axes[0] + z[:, None, None] * axes[1]
     with h5py.File(info.files["label"], "r") as hl, h5py.File(info.files["acou"], "r") as ha:
         src_voxel = float(np.array(hl["voxel_size"]).ravel()[0])
+        if roughness > 0:
+            pts = pts + boundary_jitter(pts, seed, roughness * src_voxel)
         idx = world_to_source(vol.meta, hl["label"].shape, src_voxel, pts)
         label = _sample(hl["label"], idx, 0).astype(np.uint8)
         c = _sample(ha["sound_speed"], idx, 1) * 1e3            # mm/us -> m/s
@@ -83,8 +111,14 @@ def plane_maps(pid, vol, pose, spec, depth_mm, dx_mm, lateral_margin_mm=1.0):
                 alpha_power=power, x=x, z=z, origin=origin, axes=axes, dx=dx_mm)
 
 
-def add_scatterers(maps, seed, strength=0.02, slab_mm=0.15):
-    """Lattice scatterers within +-slab of the plane -> relative density / sound-speed perturbations."""
+def add_scatterers(maps, seed, strength=0.02, slab_mm=0.15, per_cell=3):
+    """Scatterers within +-slab of the plane -> relative density / sound-speed perturbations.
+
+    Each 0.1 mm lattice cell holds per_cell independent scatterers (the first one is the
+    preview's), giving ~15-20 per resolution cell at 11 MHz (fully developed speckle needs
+    >10). Amplitudes are scaled by 1/sqrt(per_cell) so `strength` keeps its meaning (rms
+    per cell). Each scatterer is spread bilinearly over its 4 grid neighbours: rounding to the
+    nearest grid point beats the 0.1 mm lattice against the grid pitch (moire)."""
     dx, x, z, (e_lat, e_ax, e_el), o = maps["dx"], maps["x"], maps["z"], maps["axes"], maps["origin"]
     cell = scatter.SCATTER_CELL_MM
     step = cell / np.sqrt(2)
@@ -95,19 +129,25 @@ def add_scatterers(maps, seed, strength=0.02, slab_mm=0.15):
     pts = o + X[..., None] * e_lat + Z[..., None] * e_ax + Y[..., None] * e_el
     import torch
     idx = scatter.unique_cells(torch.from_numpy(pts.reshape(-1, 3)).float())
-    amp, pos = scatter.from_index(idx, seed=seed)
-    rel = pos.numpy().astype(np.float64) - o
-    px, pz, py = rel @ e_lat, rel @ e_ax, rel @ e_el
-    col = np.round((px - x[0]) / dx).astype(int)
-    row = np.round(pz / dx).astype(int)
-    ok = (np.abs(py) <= slab_mm) & (col >= 0) & (col < len(x)) & (row >= 0) & (row < len(z))
-    row, col, amp = row[ok], col[ok], amp.numpy()[ok]
-    echo = tissue.lut(tissue.ECHOGENICITY)[maps["label"][row, col]]
     delta = np.zeros(maps["c"].shape, np.float32)
-    np.add.at(delta, (row, col), strength * echo * amp)
+    echo_lut = tissue.lut(tissue.ECHOGENICITY)
+    n = 0
+    for k in range(per_cell):
+        amp, pos = scatter.from_index(idx, seed=seed + 7919 * k)
+        rel = pos.numpy().astype(np.float64) - o
+        px, pz, py = rel @ e_lat, rel @ e_ax, rel @ e_el
+        fc_, fr_ = (px - x[0]) / dx, pz / dx
+        c0_, r0_ = np.floor(fc_).astype(int), np.floor(fr_).astype(int)
+        ok = (np.abs(py) <= slab_mm) & (c0_ >= 0) & (c0_ < len(x) - 1) & (r0_ >= 0) & (r0_ < len(z) - 1)
+        c0_, r0_, wc, wr = c0_[ok], r0_[ok], (fc_ - np.floor(fc_))[ok], (fr_ - np.floor(fr_))[ok]
+        a = amp.numpy()[ok] * strength / np.sqrt(per_cell)
+        a = a * echo_lut[maps["label"][np.where(wr < 0.5, r0_, r0_ + 1), np.where(wc < 0.5, c0_, c0_ + 1)]]
+        for dr, dc, w in ((0, 0, (1 - wr) * (1 - wc)), (0, 1, (1 - wr) * wc), (1, 0, wr * (1 - wc)), (1, 1, wr * wc)):
+            np.add.at(delta, (r0_ + dr, c0_ + dc), (a * w).astype(np.float32))
+        n += int(ok.sum())
     maps["c"] = np.clip(maps["c"] * (1 + delta), 1300, 1800).astype(np.float32)
     maps["rho"] = (maps["rho"] * (1 + delta)).astype(np.float32)
-    maps["n_scatterers"] = int(ok.sum())
+    maps["n_scatterers"] = n
     return maps
 
 
@@ -186,7 +226,10 @@ def simulate(maps, spec, angles_deg=(-8, -4, 0, 4, 8), cfl=0.3, gpu=True, log=pr
         el = np.zeros((n_el, len(t)), np.float32)                   # average the points of each element
         np.add.at(el, el_of_col[cols], p)
         el /= np.maximum(np.bincount(el_of_col[cols], minlength=n_el), 1)[:, None]
-        el[:, t < 2 * t_c + max_delay] = 0.0          # transmit pulse picked up by the receiving elements
+        # the transmit pulse is recorded by the element that emits it: mute each element until its
+        # own emission has ended (emission centre tau + t_c, Gaussian tail t_c later)
+        tau_el = (x_el - xr) * np.sin(th) / C0
+        el[t[None, :] < (tau_el + 2 * t_c)[:, None]] = 0.0
         rf.append(el)
         log(f"    angle {ang:+.0f}: {nz}x{nx} grid, Nt={len(t)}, {time.time() - t0:.1f} s")
     return np.stack(rf), float(kgrid.dt), x_el, t_c
@@ -202,6 +245,7 @@ def beamform(rf, dt, x_el, t_c, angles_deg, depth_mm, width_mm, px_mm=0.1, f_num
     Z, X = torch.meshgrid(zs, xs, indexing="ij")
     xe = torch.from_numpy(x_el).to(dev, torch.float32)
     img = torch.zeros(Z.shape, dtype=torch.complex64, device=dev)
+    wsum = torch.zeros(Z.shape, device=dev)
     nt = ana.shape[-1]
     for a, ang in enumerate(angles_deg):
         th = np.deg2rad(ang)
@@ -210,31 +254,46 @@ def beamform(rf, dt, x_el, t_c, angles_deg, depth_mm, width_mm, px_mm=0.1, f_num
         for e in range(len(x_el)):
             d = X - xe[e]
             ap = (d.abs() <= Z / (2 * f_number)).float() * (0.5 + 0.5 * torch.cos(np.pi * d / (Z / (2 * f_number)).clamp(min=1e-9)))
-            ti = (t_tx + torch.sqrt(Z ** 2 + d ** 2) / C0) / dt
+            r = torch.sqrt(Z ** 2 + d ** 2)
+            ti = (t_tx + r / C0) / dt
             i0 = ti.floor().long().clamp(0, nt - 2)
             fr = (ti - i0).clamp(0, 1)
             s = ana[a, e]
             img += ap * (s[i0] * (1 - fr) + s[i0 + 1] * fr)
-    return img.abs().cpu().numpy()
+            wsum += ap / torch.sqrt(r / 1e-3)
+    # The dynamic aperture grows with depth (F-number), so the raw sum brightens with depth even
+    # in a uniform medium. In 2D each element's echo amplitude falls as 1/sqrt(r) (cylindrical
+    # spreading), hence the beamformed speckle / point amplitude scales as sum(w / sqrt(r)):
+    # dividing by it leaves a uniform, non-attenuating medium flat with depth, as a scanner's
+    # system gain calibration does. TGC then only compensates attenuation.
+    return (img.abs() / wsum.clamp(min=1e-6) * (wsum > 0)).cpu().numpy()
 
 
-def to_bmode(env, depth_mm, fc_mhz, tgc_db_cm_mhz=0.5, dr_db=55.0):
+def to_bmode(env, depth_mm, spec, alpha_power, tgc_db_cm_mhz=0.5, dr_db=55.0):
+    """Envelope -> 8-bit B-mode. TGC compensates a nominal tissue attenuation (dB/cm/MHz^y)
+    for the whole pulse spectrum, not just fc: attenuation shifts the echo spectrum down, so
+    the received energy falls more slowly than alpha*fc^y predicts and a centre-frequency TGC
+    over-amplifies the deep image."""
+    from ..realtime.renderer import spectral_attenuation_lut
     z_cm = (np.arange(env.shape[0]) + 0.5) / env.shape[0] * depth_mm / 10
-    db = 20 * np.log10(env + 1e-12) + (2 * tgc_db_cm_mhz * fc_mhz * z_cm)[:, None]
+    A, E, _, _ = spectral_attenuation_lut(spec, alpha_power, a_max=float(tgc_db_cm_mhz / 8.686 * z_cm[-1] * 1.05))
+    loss_db = -10 * np.log10(np.interp(tgc_db_cm_mhz / 8.686 * z_cm, A, E))
+    db = 20 * np.log10(env + 1e-12) + loss_db[:, None]
     db -= np.percentile(db, 99.5)
     return (np.clip(db / dr_db + 1, 0, 1) * 255).astype(np.uint8)
 
 
 def render_pose(pid, vol, pose, probe="L12-hf", depth_mm=40.0, dx_mm=0.024, angles_deg=(-8, -4, 0, 4, 8),
-                scatter_strength=0.02, log=print):
+                scatter_strength=0.02, roughness=0.5, px_mm=0.05, log=print):
     spec = PROBES[probe]
     t0 = time.time()
-    maps = plane_maps(pid, vol, pose, spec, depth_mm, dx_mm)
-    maps = add_scatterers(maps, zlib.crc32(pid.encode()) % 100_000, scatter_strength)
+    seed = zlib.crc32(pid.encode()) % 100_000
+    maps = plane_maps(pid, vol, pose, spec, depth_mm, dx_mm, seed=seed, roughness=roughness)
+    maps = add_scatterers(maps, seed, scatter_strength)
     log(f"  medium {maps['c'].shape} ready ({maps['n_scatterers']} scatterers, {time.time() - t0:.1f} s)")
     rf, dt, x_el, t_c = simulate(maps, spec, angles_deg, log=log)
-    env = beamform(rf, dt, x_el, t_c, angles_deg, depth_mm, spec.aperture * 1e3)
-    img = to_bmode(env, depth_mm, spec.fc / 1e6)
+    env = beamform(rf, dt, x_el, t_c, angles_deg, depth_mm, spec.aperture * 1e3, px_mm=px_mm)
+    img = to_bmode(env, depth_mm, spec, maps["alpha_power"])
     lab = maps["label"][:, np.abs(maps["x"]) <= spec.aperture * 1e3 / 2]    # aperture only, like the image
     lab_img = ndimage.zoom(lab, (env.shape[0] / lab.shape[0], env.shape[1] / lab.shape[1]), order=0)
     return img, lab_img, {"seconds": round(time.time() - t0, 1), "grid": list(maps["c"].shape),

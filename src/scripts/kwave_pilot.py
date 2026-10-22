@@ -83,6 +83,8 @@ def main():
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--out", default="outputs/kwave_pilot")
     ap.add_argument("--strength", type=float, default=0.02, help="scatterer perturbation for echogenicity 1")
+    ap.add_argument("--roughness", type=float, default=0.5, help="sub-voxel boundary jitter, source voxels")
+    ap.add_argument("--only", default="", help="comma-separated image numbers to render (1-based)")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -90,14 +92,18 @@ def main():
     print(json.dumps([{k: v for k, v in p.items() if k != "pose"} for p in poses], indent=1), flush=True)
     r = PreviewRenderer()
     rows, report = [], []
+    only = {int(i) for i in args.only.split(",") if i}
     for k, ps in enumerate(poses):
+        if only and k + 1 not in only:
+            continue
         t0 = time.time()
         vol = phantom.load(ps["pid"], chest_wall=False)
         for les in vol.meta.get("lesions", []):               # phantom's own lesion attenuation
             les.pop("attenuation_db_cm_mhz", None)
         pose = ps["pose"]
         print(f"[{k + 1}/{len(poses)}] {ps['pid']} {ps['kind']} depth {ps['depth']:.0f} mm", flush=True)
-        kw, lab, info = render_pose(ps["pid"], vol, pose, depth_mm=ps["depth"], scatter_strength=args.strength)
+        kw, lab, info = render_pose(ps["pid"], vol, pose, depth_mm=ps["depth"], scatter_strength=args.strength,
+                                   roughness=args.roughness)
         r.set_volume(vol)
         prev, _, _ = r.render(pose, ImagingParams(probe="L12-hf", depth_mm=ps["depth"], px_x_mm=0.1, px_z_mm=0.1,
                                                   conform=False, overlay="none", speckle_reduction=0.0))
