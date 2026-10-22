@@ -131,11 +131,21 @@ class BuildJob:
             job.listeners.discard(listener)
 
 
+_recent = {}          # pid -> Volume, most recently used last (host RAM is plentiful)
+RECENT_VOLUMES = 3
+
+
 async def _load(pid, listener):
     if renderer.vol is not None and renderer.vol.id == pid:
         return _phantom_info(renderer.vol)
-    await BuildJob.ensure(pid, listener)
-    vol = await asyncio.to_thread(phantom.load, pid)
+    vol = _recent.pop(pid, None)
+    if vol is None:
+        await BuildJob.ensure(pid, listener)
+        await listener("reading preview volume", 0)
+        vol = await asyncio.to_thread(phantom.load, pid)
+    _recent[pid] = vol
+    while len(_recent) > RECENT_VOLUMES:
+        _recent.pop(next(iter(_recent)))
 
     def swap():
         with lock:
