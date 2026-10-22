@@ -11,6 +11,8 @@ voxel i sits at i * voxel_mm.
 Preview volumes are resampled to ~0.2 mm and cached under
 $BREASTSIM_BIG/cache/preview/<id>/ as .npy files.
 """
+import contextlib
+import fcntl
 import json
 import time
 from dataclasses import dataclass, field
@@ -283,8 +285,9 @@ def cache_dir(pid):
 def build_cache(pid, log=print):
     info = get_info(pid)
     t0 = time.time()
-    log(f"[phantom] building preview cache for {pid}")
+    log(f"[phantom] {pid}: [1/4] reading source files ({info.source})")
     label, z, alpha, voxel, power = LOADERS[info.source](info)
+    log(f"[phantom] {pid}: [2/4] reorienting and writing preview volume")
     label, z, alpha, ori = canonicalize(label, z, alpha)
     out = cache_dir(pid)
     out.mkdir(parents=True, exist_ok=True)
@@ -294,8 +297,9 @@ def build_cache(pid, log=print):
     np.save(out / "alpha.npy", alpha.astype(np.float16))
     np.save(out / "surface.npy", _surface(label, voxel))
     np.save(out / "lesion_proj.npy", np.isin(label, tissue.LESIONS).any(axis=0))
-    log(f"[phantom] {pid}: finding lesions and meshing")
+    log(f"[phantom] {pid}: [3/4] finding lesions")
     lesions = find_lesions(label, voxel)
+    log(f"[phantom] {pid}: [4/4] building 3D surfaces")
     meshes = build_meshes(label, voxel, lesions)
     np.savez_compressed(out / "meshes.npz", **{f"{k}_{p}": a for k, va in meshes.items()
                                                 for p, a in zip(("verts", "faces"), va)})
@@ -318,10 +322,31 @@ def is_cached(pid):
     return f.exists() and json.loads(f.read_text()).get("version") == CACHE_VERSION
 
 
+@contextlib.contextmanager
+def _build_lock(pid):
+    """Cross-process lock so concurrent builders of one phantom wait for each other."""
+    d = cache_dir(pid)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / ".build.lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def ensure_cache(pid, log=print):
+    """Build the preview cache unless it is current (safe to call concurrently)."""
+    if is_cached(pid):
+        return
+    with _build_lock(pid):
+        if not is_cached(pid):     # another process may have finished while we waited
+            build_cache(pid, log)
+
+
 def load(pid, log=print):
     d = cache_dir(pid)
-    if not is_cached(pid):
-        build_cache(pid, log)
+    ensure_cache(pid, log)
     meta = json.loads((d / "meta.json").read_text())
     return Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
                   meta["voxel_mm"], meta["alpha_power"], np.load(d / "surface.npy"),
@@ -346,4 +371,4 @@ if __name__ == "__main__":
         for p in list_phantoms():
             print(f"{p.id:24s} {'cached' if is_cached(p.id) else '      '}  {p.description}")
     for pid in ids:
-        build_cache(pid)
+        ensure_cache(pid, log=lambda m: print(m, flush=True))

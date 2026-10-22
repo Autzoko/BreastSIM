@@ -163,7 +163,7 @@ class PreviewRenderer:
     # ------------------------------------------------------------- render
     @torch.no_grad()
     def render(self, pose: ProbePose, p: ImagingParams):
-        """Returns (rgb uint8 (H, W, 3), meta dict, lesion mask bool (H, W))."""
+        """Returns (rgb uint8 (H, W, 3), meta dict, tissue labels uint8 (H, W)) on the output grid."""
         t0 = time.perf_counter()
         vol, dev = self.vol, self.device
         spec = PROBES[p.probe]
@@ -274,4 +274,4 @@ class PreviewRenderer:
             "lesion_area_mm2": round(float(mask.sum()) * px_x * px_z, 2), "lesion_types": lesion_types,
             "render_ms": round((time.perf_counter() - t0) * 1e3, 1),
         }
-        return out, meta, mask.cpu().numpy()
+        return out, meta, lab_o.to(torch.uint8).cpu().numpy()

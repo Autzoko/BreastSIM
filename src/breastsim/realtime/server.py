@@ -11,6 +11,8 @@ import base64
 import dataclasses
 import io
 import json
+import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -63,6 +65,16 @@ def _b64(a):
     return base64.b64encode(np.ascontiguousarray(a).tobytes()).decode()
 
 
+def _nipple(vol):
+    """Nipple position (a, u, v) mm: the nipple label if present, else the skin apex."""
+    if tissue.NIPPLE in vol.meta.get("labels", {}) or str(tissue.NIPPLE) in vol.meta.get("labels", {}):
+        idx = np.argwhere(vol.label == tissue.NIPPLE)
+        if len(idx):
+            return [float(c) for c in idx.mean(0) * vol.voxel_mm]
+    iu, iv = np.unravel_index(np.nanargmax(vol.surface), vol.surface.shape)
+    return [float(vol.surface[iu, iv]), float(iu * vol.voxel_mm), float(iv * vol.voxel_mm)]
+
+
 def _phantom_info(vol):
     lesions = [dict(l) for l in vol.meta.get("lesions", [])]
     for les in lesions:  # depth of the lesion center below the skin straight above it
@@ -77,13 +89,58 @@ def _phantom_info(vol):
         "shape": list(vol.label.shape), "extent_mm": list(vol.extent_mm),
         "lesions": lesions, "start": {"u": start[0], "v": start[1]},
         "surface_range_mm": [float(np.nanmin(vol.surface)), float(np.nanmax(vol.surface))],
+        "nipple_mm": _nipple(vol),
     }
 
 
-def _load(pid, send_status):
-    vol = phantom.load(pid, log=send_status)
-    with lock:
-        renderer.set_volume(vol)
+class BuildJob:
+    """One cache build per phantom, run in a subprocess (h5py holds the GIL for
+    long reads, which would stall the event loop and drop WebSockets). Every
+    client waiting for the same phantom receives its progress lines."""
+
+    jobs = {}
+
+    def __init__(self, pid):
+        self.pid, self.listeners, self.started = pid, set(), time.time()
+        self.task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", "-m", "breastsim.phantom", self.pid,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=os.environ.copy())
+        tail = []
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            tail = (tail + [line])[-20:]
+            for cb in list(self.listeners):
+                await cb(line, time.time() - self.started)
+        if await proc.wait() != 0 or not phantom.is_cached(self.pid):
+            raise RuntimeError("cache build failed: " + " | ".join(tail[-5:]))
+
+    @classmethod
+    async def ensure(cls, pid, listener):
+        if phantom.is_cached(pid):
+            return
+        job = cls.jobs.get(pid)
+        if job is None or job.task.done() and job.task.exception():
+            job = cls.jobs[pid] = cls(pid)
+        job.listeners.add(listener)
+        try:
+            await asyncio.shield(job.task)
+        finally:
+            job.listeners.discard(listener)
+
+
+async def _load(pid, listener):
+    if renderer.vol is not None and renderer.vol.id == pid:
+        return _phantom_info(renderer.vol)
+    await BuildJob.ensure(pid, listener)
+    vol = await asyncio.to_thread(phantom.load, pid)
+
+    def swap():
+        with lock:
+            renderer.set_volume(vol)
+    await asyncio.to_thread(swap)
     return _phantom_info(vol)
 
 
@@ -107,6 +164,8 @@ def config():
         "default_preset": DEFAULT_PRESET,
         "params": dataclasses.asdict(ImagingParams.from_preset(DEFAULT_PRESET)),
         "tissue_names": {int(k): v for k, v in tissue.NAMES.items()},
+        "tissue_colors": {int(k): list(v) for k, v in tissue.COLORS.items()},
+        "lesion_labels": list(tissue.LESIONS),
     }
 
 
@@ -145,21 +204,33 @@ async def save_scene(scene: dict):
 @app.websocket("/ws")
 async def ws(sock: WebSocket):
     await sock.accept()
-    loop = asyncio.get_running_loop()
 
-    def status(msg):
-        asyncio.run_coroutine_threadsafe(sock.send_text(json.dumps({"type": "status", "msg": str(msg)})), loop)
+    async def send(obj):  # the client may have gone away while we were busy
+        try:
+            await sock.send_text(json.dumps(obj))
+        except Exception:
+            pass
 
+    async def progress(line, elapsed):
+        await send({"type": "loading", "msg": line.split(": ", 1)[-1], "elapsed": round(elapsed)})
+
+    async def do_load(pid):
+        await send({"type": "loading", "phantom": pid, "msg": "opening", "elapsed": 0,
+                    "cached": phantom.is_cached(pid)})
+        try:
+            info = await _load(pid, progress)
+            await send({"type": "loaded", "phantom": info})
+        except Exception as e:  # report instead of dropping the connection
+            await send({"type": "error", "msg": f"load failed: {e}"})
+
+    load_task = None
     try:
         while True:
             msg = json.loads(await sock.receive_text())
             if msg["type"] == "load":
-                await sock.send_text(json.dumps({"type": "status", "msg": f"loading {msg['phantom']} ..."}))
-                try:
-                    info = await asyncio.to_thread(_load, msg["phantom"], status)
-                    await sock.send_text(json.dumps({"type": "loaded", "phantom": info}))
-                except Exception as e:  # report instead of dropping the connection
-                    await sock.send_text(json.dumps({"type": "error", "msg": f"load failed: {e!r}"}))
+                if load_task and not load_task.done():
+                    load_task.cancel()          # newer choice wins; the build itself keeps running
+                load_task = asyncio.create_task(do_load(msg["phantom"]))
             elif msg["type"] == "render":
                 if renderer.vol is None:
                     await sock.send_text(json.dumps({"type": "error", "msg": "no phantom loaded"}))
@@ -171,17 +242,19 @@ async def ws(sock: WebSocket):
                     with lock:
                         return renderer.render(pose, params)
                 try:
-                    img, meta, _ = await asyncio.to_thread(run)
+                    img, meta, labels = await asyncio.to_thread(run)
                 except Exception as e:
                     await sock.send_text(json.dumps({"type": "error", "msg": f"render failed: {e!r}"}))
                     continue
                 t0 = time.perf_counter()
                 data = _encode(img)
+                lab_png = _encode(labels, "PNG")    # ground-truth tissue codes on the image grid
                 meta.update(encode_ms=round((time.perf_counter() - t0) * 1e3, 1), phantom=renderer.vol.id,
                             seq=msg.get("seq"))
-                await sock.send_text(json.dumps({"type": "frame", "meta": meta}))
+                await sock.send_text(json.dumps({"type": "frame", "meta": meta, "binaries": ["bmode", "labels"]}))
                 await sock.send_bytes(data)
-    except WebSocketDisconnect:
+                await sock.send_bytes(lab_png)
+    except (WebSocketDisconnect, RuntimeError):  # RuntimeError: send after the client closed
         pass
 
 

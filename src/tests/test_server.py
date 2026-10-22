@@ -17,6 +17,7 @@ def client(synthetic_volume, monkeypatch, tmp_path):
     meshes = phantom.build_meshes(synthetic_volume.label, synthetic_volume.voxel_mm, synthetic_volume.meta["lesions"])
     monkeypatch.setattr(server.phantom, "load", lambda pid, log=print: synthetic_volume)
     monkeypatch.setattr(server.phantom, "load_meshes", lambda pid: meshes)
+    monkeypatch.setattr(server.phantom, "is_cached", lambda pid: True)
     monkeypatch.setattr(server, "SCENES", tmp_path / "scenes")
     monkeypatch.setattr(server.paths, "ROOT", tmp_path)
     server.renderer = PreviewRenderer("cpu")
@@ -43,7 +44,7 @@ def test_ws_load_render_and_meshes(client):
             if msg["type"] == "loaded":
                 info = msg["phantom"]
                 break
-            assert msg["type"] == "status"
+            assert msg["type"] == "loading"
         assert len(info["lesions"]) == 1
         assert info["lesions"][0]["depth_below_skin_mm"] == pytest.approx(15, abs=0.6)
         pose = {"u": info["start"]["u"], "v": info["start"]["v"], "rotation": 0, "tilt": 0, "rock": 0, "standoff": 0}
@@ -52,10 +53,13 @@ def test_ws_load_render_and_meshes(client):
         assert meta["type"] == "frame" and meta["meta"]["seq"] == 1 and meta["meta"]["lesion_area_mm2"] > 0
         img = Image.open(io.BytesIO(ws.receive_bytes()))
         assert img.format == "JPEG" and img.size[0] > 100
+        lab = np.array(Image.open(io.BytesIO(ws.receive_bytes())))
+        assert lab.shape == (img.size[1], img.size[0]) and (lab == 200).any()
+        assert info["nipple_mm"][0] == pytest.approx(30.0, abs=1.0)    # dome apex
         # unknown fields are ignored, bad phantom ids are reported, not fatal
         ws.send_text(json.dumps({"type": "render", "seq": 2, "pose": {**pose, "junk": 1}, "params": {**params, "junk": 1}}))
         assert json.loads(ws.receive_text())["meta"]["seq"] == 2
-        ws.receive_bytes()
+        ws.receive_bytes(), ws.receive_bytes()
     m = client.get("/api/meshes").json()
     v = np.frombuffer(base64.b64decode(m["lesion0"]["verts"]), np.float32)
     assert len(v) == 3 * m["lesion0"]["n_verts"]

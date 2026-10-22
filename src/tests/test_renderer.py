@@ -2,6 +2,10 @@ import numpy as np
 import pytest
 
 from breastsim import tissue
+
+
+def lesion_mask(labels):
+    return np.isin(labels, tissue.LESIONS)
 from breastsim.presets import PRESETS
 from breastsim.probe import ProbePose
 from breastsim.realtime.renderer import ImagingParams, PreviewRenderer
@@ -22,7 +26,8 @@ def lesion_pose(vol, **kw):
 def test_output_grid_matches_preset(renderer, synthetic_volume):
     for name in PRESETS:
         p = ImagingParams.from_preset(name, elevation_samples=4)
-        img, meta, mask = renderer.render(lesion_pose(synthetic_volume), p)
+        img, meta, labels = renderer.render(lesion_pose(synthetic_volume), p)
+        mask = lesion_mask(labels)
         assert img.dtype == np.uint8 and img.shape[2] == 3 and img.shape[:2] == mask.shape
         assert meta["px_x_mm"] == pytest.approx(p.px_x_mm, rel=0.02)
         assert meta["px_z_mm"] == pytest.approx(p.px_z_mm, rel=0.02)
@@ -32,15 +37,16 @@ def test_output_grid_matches_preset(renderer, synthetic_volume):
 def test_lesion_mask_geometry(renderer, synthetic_volume):
     vol = synthetic_volume
     p = ImagingParams.from_preset("busi", elevation_samples=4)
-    img, meta, mask = renderer.render(lesion_pose(vol), p)
+    img, meta, labels = renderer.render(lesion_pose(vol), p)
+    mask = lesion_mask(labels)
     # 6 mm sphere cut through its center: ~28 mm^2, centred laterally, ~15 mm below the skin
     assert meta["lesion_area_mm2"] == pytest.approx(np.pi * 9, rel=0.2)
     rows, cols = np.nonzero(mask)
     assert cols.mean() * meta["px_x_mm"] == pytest.approx(meta["width_mm"] / 2, abs=0.5)
     assert rows.mean() * meta["px_z_mm"] == pytest.approx(15.0, abs=0.7)
     assert meta["lesion_types"] == [tissue.NAMES[tissue.TUMOR]]
-    _, meta_far, mask_far = renderer.render(ProbePose(u=lesion_pose(vol).u, v=lesion_pose(vol).v + 12), p)
-    assert not mask_far.any() and meta_far["lesion_area_mm2"] == 0
+    _, meta_far, labels_far = renderer.render(ProbePose(u=lesion_pose(vol).u, v=lesion_pose(vol).v + 12), p)
+    assert not lesion_mask(labels_far).any() and meta_far["lesion_area_mm2"] == 0
 
 
 def test_render_is_deterministic(renderer, synthetic_volume):
@@ -66,7 +72,8 @@ def test_speckle_decorrelates_with_elevation_shift(renderer, synthetic_volume):
 
 def test_tumor_is_hypoechoic_with_posterior_shadow(renderer, synthetic_volume):
     p = ImagingParams.from_preset("busi", elevation_samples=8, overlay="none")
-    img, meta, mask = renderer.render(lesion_pose(synthetic_volume), p)
+    img, meta, labels = renderer.render(lesion_pose(synthetic_volume), p)
+    mask = lesion_mask(labels)
     g = img[..., 0].astype(float)
     rows, cols = np.nonzero(mask)
     c0, c1 = cols.min(), cols.max()

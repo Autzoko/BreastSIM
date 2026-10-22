@@ -7,8 +7,8 @@
 <link rel="stylesheet" href="/static/style.css">
 <script type="importmap">
 { "imports": {
-  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  "three": "/static/vendor/three/three.module.js",
+  "three/addons/": "/static/vendor/three/addons/"
 } }
 </script>
 </head>
@@ -16,47 +16,87 @@
 <header>
   <strong class="brand">BreastSIM</strong><span class="muted">Probe Lab</span>
   <label>Phantom <select id="phantom"></select></label>
+  <label>Side <select id="side"><option value="RT">Right</option><option value="LT">Left</option></select></label>
   <label>Scan preset <select id="preset"></select></label>
   <span id="status" class="muted">connecting…</span>
+  <button id="helpBtn" title="Keyboard and mouse controls">?</button>
 </header>
 <main>
   <section id="stage" class="card">
     <div id="scene3d"></div>
     <div class="toolbar">
       <label><input type="checkbox" id="showSkin" checked> Skin</label>
-      <label><input type="checkbox" id="showGland"> Gland</label>
+      <label><input type="checkbox" id="showGland"> Glandular</label>
       <label><input type="checkbox" id="showLesions" checked> Lesions</label>
       <label><input type="checkbox" id="showPlane" checked> Scan plane</label>
-      <label class="op">Skin opacity <input type="range" id="skinOpacity" min="0.05" max="1" step="0.05" value="0.25"></label>
+      <label><input type="checkbox" id="showGuides" checked> Guides</label>
+      <label class="op">Skin <input type="range" id="skinOpacity" min="0.05" max="1" step="0.05" value="0.22"></label>
       <button id="recenter">Recenter</button>
     </div>
     <div class="hint muted small">click skin: place probe · drag: orbit · right-drag: pan · wheel: zoom</div>
   </section>
+
   <section id="imagePane">
-    <div class="card">
-      <canvas id="bmode" width="480" height="540"></canvas>
+    <div class="card viewer">
+      <div class="views">
+        <div class="view">
+          <div class="viewtitle">B-mode</div>
+          <div class="imgwrap"><canvas id="bmode" width="480" height="540"></canvas><canvas id="annot"></canvas></div>
+        </div>
+        <div class="view" id="gtView">
+          <div class="viewtitle">Ground truth (tissue labels)</div>
+          <div class="imgwrap"><canvas id="gt" width="480" height="540"></canvas></div>
+          <div id="legend" class="legend small"></div>
+        </div>
+      </div>
       <div id="readouts" class="readouts"></div>
+      <div class="row small">
+        <label><input type="checkbox" id="showGT" checked> ground truth</label>
+        <label><input type="checkbox" id="showAnnot" checked> annotations</label>
+        <label>Overlay <select id="overlay">
+          <option value="contour">lesion contour</option>
+          <option value="labels">tissue labels</option>
+          <option value="none">none</option>
+        </select></label>
+        <span class="muted">drag on image: caliper · Esc: clear</span>
+        <button id="save">Save scene</button>
+      </div>
       <div id="perf" class="muted mono small"></div>
     </div>
     <div class="cols">
-      <div class="card">
-        <div class="cardtitle">Lesions</div>
-        <div id="lesions" class="small"></div>
-      </div>
+      <div class="card"><div class="cardtitle">Lesions</div><div id="lesions" class="small"></div></div>
       <div class="card" id="pose"><div class="cardtitle">Probe</div></div>
       <div class="card" id="imaging"><div class="cardtitle">Imaging</div></div>
     </div>
-    <div class="card row">
-      <label>Overlay <select id="overlay">
-        <option value="contour">lesion contour</option>
-        <option value="labels">tissue labels</option>
-        <option value="none">none</option>
-      </select></label>
-      <button id="save">Save scene</button>
-      <span class="muted small">W/S elevation · A/D lateral · Q/E rotate · R/F tilt · Z/X rock · Shift ×5</span>
-    </div>
   </section>
 </main>
+
+<div id="loading" hidden>
+  <div class="loadbox">
+    <div class="spinner"></div>
+    <div><div id="loadTitle">Loading</div><div id="loadMsg" class="muted small"></div></div>
+  </div>
+</div>
+
+<div id="help" hidden>
+  <div class="loadbox help">
+    <div class="cardtitle">Controls</div>
+    <table class="small">
+      <tr><td>Click skin (3D)</td><td>place the probe</td></tr>
+      <tr><td>Drag / right-drag / wheel (3D)</td><td>orbit / pan / zoom</td></tr>
+      <tr><td>W / S</td><td>slide along elevation</td></tr>
+      <tr><td>A / D</td><td>slide along the array</td></tr>
+      <tr><td>Q / E</td><td>rotate the probe</td></tr>
+      <tr><td>R / F</td><td>tilt (fan) the beam</td></tr>
+      <tr><td>Z / X</td><td>rock the beam</td></tr>
+      <tr><td>Shift + key</td><td>5× step</td></tr>
+      <tr><td>Drag on B-mode</td><td>caliper (distance in mm); Esc clears</td></tr>
+    </table>
+    <p class="muted small">Clock positions follow the ACR convention as seen facing the patient (12 o'clock superior).
+      The phantom frame is assumed to be: +u superior, +v toward the patient's left; set the side above.</p>
+    <button id="helpClose">Close</button>
+  </div>
+</div>
 <script type="module" src="/static/app.js"></script>
 </body>
 </html>
