@@ -57,6 +57,37 @@ def http_get(url, referer=None):
         return r.read()
 
 
+ARIA2 = shutil.which("aria2c") or shutil.which("aria2c", path=str(Path(sys.executable).parent))
+
+
+def download(url, dest, referer=None, size=None, attempts=30):
+    """Resumable download; aria2c with 8 connections if available, else curl.
+
+    Single-connection S3 (Illinois Data Bank) runs at ~5 MB/s on lab127,
+    8 connections at ~55 MB/s.
+    """
+    dest = Path(dest)
+    if size and dest.exists() and dest.stat().st_size == size:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not ARIA2:
+        return curl(url, dest, referer, size, attempts)
+    cmd = [ARIA2, "-c", "-x", "8", "-s", "8", "-k", "20M", "--file-allocation=none",
+           "--max-tries=10", "--retry-wait=30", "--allow-overwrite=true", "--auto-file-renaming=false",
+           "--summary-interval=0", "--console-log-level=warn", "--download-result=hide",
+           "-U", UA, "-d", str(dest.parent), "-o", dest.name]
+    if referer:
+        cmd += [f"--referer={referer}"]
+    control = dest.with_name(dest.name + ".aria2")
+    for i in range(1, attempts + 1):
+        rc = subprocess.call(cmd + [url])
+        if rc == 0 and not control.exists() and (size is None or dest.stat().st_size == size):
+            return dest
+        log(f"  aria2c rc={rc} ({dest.stat().st_size if dest.exists() else 0} B), retry {i}/{attempts}")
+        time.sleep(min(30 * i, 300))
+    raise RuntimeError(f"download failed: {url}")
+
+
 def curl(url, dest, referer=None, size=None, attempts=30):
     """Resumable download with curl; retries until the file is complete."""
     dest = Path(dest)
@@ -137,7 +168,7 @@ def dataverse(doi, out, keep=lambda f: True):
         if str(rel) in st:
             continue
         log(f"  {rel} ({df['filesize'] / 1e6:.1f} MB)")
-        curl(f"{DATAVERSE}/api/access/datafile/{df['id']}", out / rel, size=df["filesize"])
+        download(f"{DATAVERSE}/api/access/datafile/{df['id']}", out / rel, size=df["filesize"])
         st.add(str(rel))
 
 
@@ -153,7 +184,7 @@ def idb_files(dataset_id):
 
 
 def idb_download(dataset_id, file_id, dest):
-    return curl(f"{IDB}/datafiles/{file_id}/download", dest, referer=f"{IDB}/datasets/{dataset_id}")
+    return download(f"{IDB}/datafiles/{file_id}/download", dest, referer=f"{IDB}/datasets/{dataset_id}")
 
 
 # ----------------------------------------------------------------- datasets
@@ -184,7 +215,7 @@ def fetch_oa_breast():
         if name in st:
             continue
         log(f"  {name}")
-        curl(f"https://wustl.box.com/index.php?rm=box_download_shared_file"
+        download(f"https://wustl.box.com/index.php?rm=box_download_shared_file"
              f"&shared_name={OA_BOX}&file_id=f_{fid}", out / name)
         st.add(name)
 
@@ -225,7 +256,7 @@ def fetch_real_busbra():
     out = dataset_dir("real/busbra", big=False)
     st = State(out)
     if "BUSBRA.zip" not in st:
-        z = curl("https://zenodo.org/api/records/8231412/files/BUSBRA.zip/content", out / "BUSBRA.zip")
+        z = download("https://zenodo.org/api/records/8231412/files/BUSBRA.zip/content", out / "BUSBRA.zip")
         unzip(z, out)
         z.unlink()
         st.add("BUSBRA.zip")
@@ -240,7 +271,7 @@ def fetch_real_breast_lesions_usg():
                  "BrEaST-Lesions-USG-clinical-data-Dec-15-2023.xlsx"]:
         if name in st:
             continue
-        f = curl(base + name, out / name)
+        f = download(base + name, out / name)
         if name.endswith(".zip"):
             unzip(f, out)
             f.unlink()
