@@ -146,7 +146,7 @@ def test_refraction_edge_shadows_at_lesion_margins():
     edges = np.r_[cols.min() - int(0.5 / px):cols.min() + int(0.5 / px), cols.max() - int(0.5 / px):cols.max() + int(0.5 / px)]
     far = np.r_[: cols.min() - int(6 / px), cols.max() + int(6 / px):]
     # dark streaks behind the margins (same attenuation everywhere: pure refraction effect) ...
-    assert prof[edges].mean() < prof[far].mean() - 2.0
+    assert prof[edges].mean() < prof[far].mean() - 1.5
     # ... that vanish when the boundary-transmission model is off
     assert abs(prof_off[edges].mean() - prof_off[far].mean()) < 1.0
 

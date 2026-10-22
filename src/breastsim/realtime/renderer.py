@@ -305,8 +305,8 @@ class PreviewRenderer:
         smoothed impedance field, incidence theta1 = acos|n . e_ax|:
           - Snell: sin theta2 = c2/c1 sin theta1 (total reflection beyond the
             critical angle), Fresnel intensity R(theta), and the share of the
-            refracted beam still inside the receive acceptance,
-            exp(-(theta1 - theta2)^2 / (2 theta0^2)); the two-way transmission T^2
+            refracted beam still inside the aperture half-angle,
+            exp(-(theta1 - theta2)^2 / (2 (2 theta0)^2)); the two-way transmission T^2
             is accumulated below the boundary -> refraction / edge shadows;
           - echo amplitude r = (Z2-Z1)/(Z2+Z1) times the angle factor
             (1-s) exp(-theta^2 / (2 theta0^2)) + s cos theta, theta0 = 0.25/F#, s = 0.25.
@@ -357,9 +357,10 @@ class PreviewRenderer:
                 rr = ((z2 * cos1 - z1 * cos2) / (z2 * cos1 + z1 * cos2).clamp(min=1e-9)) ** 2
                 theta = torch.acos(cos1)
                 # refraction steers the transmitted beam by |theta1 - theta2|; energy bent outside the
-                # receive acceptance (~theta0) leaves the line of sight -> lateral edge shadows
+                # aperture half-angle (~1/(2F#), i.e. 2x the specular lobe, which deviates by 2 theta)
+                # leaves the line of sight -> lateral edge shadows
                 bend = (theta - torch.asin(sin2.clamp(max=1.0))).abs()
-                T = torch.where(total, torch.zeros_like(rr), (1 - rr) * torch.exp(-0.5 * (bend / theta0) ** 2))
+                T = torch.where(total, torch.zeros_like(rr), (1 - rr) * torch.exp(-0.5 * (bend / (2 * theta0)) ** 2))
                 if p.edge_shadow_db > 0:
                     thin = self.thin_lut[l1] | self.thin_lut[l2]
                     two_way = -2 * torch.log(T.clamp(min=1e-6))
