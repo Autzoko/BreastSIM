@@ -229,7 +229,7 @@ def _kwave_run(c, rho, alpha, power, dx, cols, delays, apod, spec, t_end, cfl=0.
 
 
 def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, margin_mm=1.5, f_number=1.5,
-                     px_mm=0.05, tx_apod="tukey", gpu=True, device=None, log=print):
+                     px_mm=0.05, tx_apod="tukey", gpu=True, device=None, workers=4, log=print):
     """Conventional focused line-by-line B-mode, as in k-Wave's example_us_bmode_linear_transducer:
     for every scan line the active sub-aperture (n_active elements centred on the line) fires a
     beam focused at focus_mm and receives; only the medium under the sub-aperture (+ margin) is
@@ -252,8 +252,8 @@ def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, 
     img = np.zeros((len(zs), len(lines)), np.complex64)
     mcols = int(round(margin_mm * 1e-3 / dx))
     zt = torch.from_numpy(zs).to(dev, torch.float64)
-    t_line = time.time()
-    for li, (l, xl) in enumerate(zip(lines, x_lines)):
+    def run_line(li):
+        l, xl = lines[li], x_lines[li]
         act = np.arange(max(l - n_active // 2, 0), min(l + n_active // 2, n_el))
         acols = np.nonzero(np.isin(el_of_col, act))[0]
         lo, hi = max(acols.min() - mcols, 0), min(acols.max() + 1 + mcols, len(x))
@@ -261,8 +261,8 @@ def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, 
         r_f = np.sqrt(zf ** 2 + (x_el[act] - xl) ** 2)
         tau = (r_f.max() - r_f) / C0                                  # per element, outer ones first
         w = np.ones(len(act))
-        if tx_apod == "tukey":
-            w = signal.windows.tukey(len(act), 0.5) if len(act) > 2 else w
+        if tx_apod == "tukey" and len(act) > 2:
+            w = signal.windows.tukey(len(act), 0.5)
         e_idx = el_of_col[acols] - act[0]
         t_end = 2 * depth_mm * 1e-3 / 1400 + 2 * t_c + tau.max()
         p, t = _kwave_run(maps["c"][:, sub], maps["rho"][:, sub], maps["alpha"][:, sub], maps["alpha_power"], dx,
@@ -271,6 +271,10 @@ def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, 
         np.add.at(rf, e_idx, p)
         rf /= np.maximum(np.bincount(e_idx, minlength=len(act)), 1)[:, None]
         rf[t[None, :] < (tau + 2 * t_c)[:, None]] = 0.0             # own transmit pulse
+        return li, act, r_f, rf, t, hi - lo
+
+    def beamform_line(li, act, r_f, rf, t):
+        xl = x_lines[li]
         ana = torch.from_numpy(signal.hilbert(rf, axis=-1).astype(np.complex64)).to(dev)
         dt = float(t[1] - t[0])
         # transmit arrival on the line axis: all elements meet at the focus at max(r_f)/c0
@@ -287,10 +291,19 @@ def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, 
         wsum = (ap / torch.sqrt(r / 1e-3)).sum(1)
         col = ((ap.float() * (s0 * (1 - fr) + s1 * fr)).sum(1) / wsum.clamp(min=1e-6).float()) * (wsum > 0)
         img[:, li] = col.cpu().numpy()
-        if li % 16 == 0:
-            el_t = time.time() - t_line
-            log(f"    line {li + 1}/{len(lines)}: grid {maps['c'].shape[0]}x{hi - lo}, Nt={len(t)}, "
-                f"{el_t / (li + 1):.1f} s/line")
+
+    # Each line is a small grid that leaves most of the GPU idle, so several k-Wave runs go in
+    # parallel (each in its own process via the k-Wave binary; the threads only wait on them).
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    t_line = time.time()
+    with ThreadPoolExecutor(workers) as pool:
+        futs = [pool.submit(run_line, li) for li in range(len(lines))]
+        for k_done, f in enumerate(as_completed(futs)):
+            li, act, r_f, rf, t, width = f.result()
+            beamform_line(li, act, r_f, rf, t)
+            if k_done % 32 == 0:
+                log(f"    {k_done + 1}/{len(lines)} lines: grid {maps['c'].shape[0]}x{width}, Nt={len(t)}, "
+                    f"{(time.time() - t_line) / (k_done + 1):.2f} s/line ({workers} parallel)")
     # lines -> px_mm lateral grid over the aperture
     xs = np.arange(-spec.aperture / 2, spec.aperture / 2, px_mm * 1e-3)
     re = np.stack([np.interp(xs, x_lines, row.real) for row in img])
