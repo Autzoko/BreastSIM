@@ -80,8 +80,10 @@ def download(url, dest, referer=None, size=None, attempts=30):
         cmd += [f"--referer={referer}"]
     control = dest.with_name(dest.name + ".aria2")
     for i in range(1, attempts + 1):
-        rc = subprocess.call(cmd + [url])
-        if rc == 0 and not control.exists() and (size is None or dest.stat().st_size == size):
+        # keep SIGPIPE ignored: aria2c dies with -13 on dropped sockets otherwise
+        rc = subprocess.call(cmd + [url], restore_signals=False)
+        complete = dest.exists() and not control.exists()
+        if complete and (dest.stat().st_size == size if size else rc == 0):
             return dest
         log(f"  aria2c rc={rc} ({dest.stat().st_size if dest.exists() else 0} B), retry {i}/{attempts}")
         time.sleep(min(30 * i, 300))
