@@ -3,7 +3,7 @@ const $ = (id) => document.getElementById(id);
 const S = {
   phantom: null, info: null, probes: {}, overview: null,
   pose: { u: 0, v: 0, rotation: 0, tilt: 0, rock: 0, standoff: 0 },
-  params: {}, dirty: false, inFlight: false, pendingMeta: null, frames: [],
+  params: {}, dirty: false, inFlight: 0, pendingMeta: null, frames: [], sent: [],
 };
 
 const POSE_SLIDERS = [
@@ -53,7 +53,7 @@ function connect() {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   ws.binaryType = "blob";
   ws.onopen = () => { status("connected"); if (S.phantom) load(S.phantom); };
-  ws.onclose = () => { status("disconnected — retrying"); S.inFlight = false; setTimeout(connect, 1500); };
+  ws.onclose = () => { status("disconnected — retrying"); S.inFlight = 0; setTimeout(connect, 1500); };
   ws.onmessage = async (ev) => {
     if (typeof ev.data !== "string") return drawFrame(await createImageBitmap(ev.data));
     const msg = JSON.parse(ev.data);
@@ -87,10 +87,11 @@ function request() {
   drawOverview();
 }
 function pump() {
-  if (!S.dirty || S.inFlight || !S.info || ws.readyState !== 1) return;
+  // two requests in flight hide the network round trip behind rendering
+  if (!S.dirty || S.inFlight >= 2 || !S.info || ws.readyState !== 1) return;
   S.dirty = false;
-  S.inFlight = true;
-  S.sent = performance.now();
+  S.inFlight += 1;
+  S.sent.push(performance.now());
   ws.send(JSON.stringify({ type: "render", pose: S.pose, params: S.params }));
 }
 
@@ -110,9 +111,9 @@ function drawFrame(bmp) {
   const now = performance.now();
   S.frames = S.frames.filter((t) => now - t < 1000).concat(now);
   $("readout").textContent =
-    `${S.frames.length} fps · render ${m.render_ms} ms · rtt ${(now - S.sent).toFixed(0)} ms · ` +
+    `${S.frames.length} fps · render ${m.render_ms} ms · rtt ${(now - S.sent.shift()).toFixed(0)} ms · ` +
     `u ${S.pose.u.toFixed(1)} v ${S.pose.v.toFixed(1)} mm · face a ${(+m.face_a_mm).toFixed(1)} mm · lesion px ${m.lesion_pixels}`;
-  S.inFlight = false;
+  S.inFlight = Math.max(0, S.inFlight - 1);
   pump();
 }
 
