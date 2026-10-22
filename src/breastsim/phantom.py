@@ -64,10 +64,12 @@ def list_phantoms():
             "density": f.with_name(f.name.replace("_label", "_density")),
             "aa": f.with_name(f.name.replace("_label", "_aa"))},
             f"USCT NBP, BI-RADS {t}, tumor"))
+    state = paths.DATA / "nbp3d_oat64" / ".fetch_state.json"
+    finished = set(json.loads(state.read_text())) if state.exists() else set()
     for f in sorted((paths.DATA / "nbp3d_oat64").glob("*/*/*_label.mat")):
         acou = f.with_name(f.name.replace("_label", "_acou"))
-        if not acou.exists():
-            continue
+        if f"{f.parent.name}.zip" not in finished or not acou.exists():
+            continue  # still being extracted by fetch_data.py
         name = f.name.split("_")[0]
         kind = "lesion" if name.endswith("l") else "healthy"
         out.append(PhantomInfo(f"oat64/{name}", "oat64", {"label": f, "acou": acou},

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BreastSIM Preview</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <strong>BreastSIM</strong> <span class="muted">real-time preview</span>
+  <span id="status" class="muted">connecting…</span>
+</header>
+<main>
+  <section id="view">
+    <canvas id="bmode" width="384" height="400"></canvas>
+    <div id="readout" class="muted mono"></div>
+  </section>
+  <aside>
+    <div class="group">
+      <label>Phantom <select id="phantom"></select></label>
+      <div id="pdesc" class="muted small"></div>
+      <canvas id="overview" width="260" height="260" title="click: place probe · wheel: rotate"></canvas>
+    </div>
+    <div class="group" id="pose"></div>
+    <div class="group" id="imaging"></div>
+    <div class="group row">
+      <label>Overlay <select id="overlay">
+        <option value="contour">lesion contour</option>
+        <option value="labels">tissue labels</option>
+        <option value="none">none</option>
+      </select></label>
+      <button id="save">Save scene</button>
+    </div>
+    <div class="muted small">
+      Keys: W/S elevation · A/D lateral · Q/E rotate · R/F tilt · Z/X rock · Shift ×5
+    </div>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
