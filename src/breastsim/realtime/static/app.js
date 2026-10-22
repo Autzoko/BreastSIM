@@ -87,7 +87,7 @@ function initScene() {
 
   // probe: body + face strip, local x = lateral, y = up (against the beam), z = elevation
   const probe = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0xd8dde4, metalness: 0.1, roughness: 0.5 }));
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0xd8dde4, metalness: 0.1, roughness: 0.5, transparent: true, opacity: 0.55, depthWrite: false }));
   const face = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0x4cc38a, emissive: 0x1b5c3d }));
   const marker = new THREE.Mesh(new THREE.SphereGeometry(1.6, 16, 12), new THREE.MeshStandardMaterial({ color: 0x4cc38a, emissive: 0x2a7a52 }));
   probe.add(body, face, marker);
@@ -189,8 +189,8 @@ function updateProbe3D(meta, bitmap) {
   const m = new THREE.Matrix4().makeBasis(X, Y, Z).setPosition(T(o));
   three.probe.matrixAutoUpdate = false;
   three.probe.matrix.copy(m);
-  const handle = Math.max(18, W * 0.15);
-  three.body.scale.set(W + 4, handle, H + 6); three.body.position.set(0, handle / 2 + 1.5, 0);
+  const handle = 12;
+  three.body.scale.set(W + 2, handle, H + 3); three.body.position.set(0, handle / 2 + 1.5, 0);
   three.face.scale.set(W, 1.5, H); three.face.position.set(0, 0.75, 0);
   three.marker.position.set(-W / 2 - 3, handle * 0.7, 0);  // orientation marker on the left end
 
@@ -206,8 +206,12 @@ function updateProbe3D(meta, bitmap) {
   three.planeGeo.attributes.position.needsUpdate = true;
   three.planeGeo.computeBoundingSphere();
   if (bitmap) {
-    three.texCanvas.width = bitmap.width; three.texCanvas.height = bitmap.height;
-    three.texCanvas.getContext("2d").drawImage(bitmap, 0, 0);
+    const c = three.texCanvas;
+    if (c.width !== bitmap.width || c.height !== bitmap.height) {
+      c.width = bitmap.width; c.height = bitmap.height;
+      three.texture.dispose();  // GPU storage is immutable: reallocate at the new size
+    }
+    c.getContext("2d").drawImage(bitmap, 0, 0);
     three.texture.needsUpdate = true;
   }
 }
