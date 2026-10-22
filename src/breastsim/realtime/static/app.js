@@ -26,6 +26,7 @@ const IMG_SLIDERS = [
   ["specular", "specular", 0, 40, 1],
   ["speckle_reduction", "smooth", 0, 3, 0.1],
   ["lateral_f_number", "F#", 1, 4, 0.1],
+  ["shadow_blur_mm", "shadow fill", 0, 4, 0.1],
 ];
 const PRESET_KEYS = ["probe", "depth_mm", "px_x_mm", "px_z_mm", "gain_db", "dynamic_range_db",
   "speckle_reduction", "lateral_f_number", "conform"];
@@ -158,6 +159,7 @@ async function loadMeshes() {
     three.meshes[name] = mesh;
     three.anatomy.add(mesh);
   }
+  S.meshCount = Object.keys(three.meshes).length;
   applyVisibility();
   recenter(true);
 }

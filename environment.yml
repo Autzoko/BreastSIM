@@ -19,5 +19,6 @@ dependencies:
       - k-wave-python
       - fastapi
       - uvicorn[standard]
+      - playwright          # e2e UI check (src/scripts/e2e_check.py)
 # PyMUST is installed editable from lib/PyMUST, and PyTorch per platform,
 # by src/scripts/setup_env.sh.

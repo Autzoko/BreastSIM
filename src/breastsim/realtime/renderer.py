@@ -43,6 +43,7 @@ class ImagingParams:
     lateral_f_number: float = 2.0     # minimum receive F-number
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
     conform: bool = True              # probe presses the skin flat
+    shadow_blur_mm: float = 1.0       # lateral beam extent averaging the attenuation (partial shadows)
     overlay: str = "contour"          # none | contour | labels
     elevation_samples: int = 5        # impedance planes across the elevation beam (specular term)
     preset: str = DEFAULT_PRESET
@@ -209,6 +210,8 @@ class PreviewRenderer:
         lab_c, alpha_c = center[0].long(), center[1]
         f_mhz = spec.fc / 1e6
         att_np = torch.cumsum(alpha_c * f_mhz ** vol.alpha_power * self.DZ_MM * 1e-3, 0)
+        if p.shadow_blur_mm > 0:  # a finite-width beam fills shadows in from the sides
+            att_np = _conv_along(att_np, _gauss_kernel(p.shadow_blur_mm / dx, dev), 1)
         tgc_np = p.tgc_db_cm_mhz * 100 * NP_PER_DB * f_mhz * z[:, None] * 1e-3
         gain = torch.exp(2 * (tgc_np - att_np))
 
