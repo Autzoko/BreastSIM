@@ -60,7 +60,7 @@ def http_get(url, referer=None):
 ARIA2 = shutil.which("aria2c") or shutil.which("aria2c", path=str(Path(sys.executable).parent))
 
 
-def download(url, dest, referer=None, size=None, attempts=30):
+def download(url, dest, referer=None, size=None, attempts=30, ua=UA):
     """Resumable download; aria2c with 8 connections if available, else curl.
 
     Single-connection S3 (Illinois Data Bank) runs at ~5 MB/s on lab127,
@@ -71,11 +71,11 @@ def download(url, dest, referer=None, size=None, attempts=30):
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not ARIA2:
-        return curl(url, dest, referer, size, attempts)
+        return curl(url, dest, referer, size, attempts, ua)
     cmd = [ARIA2, "-c", "-x", "8", "-s", "8", "-k", "20M", "--file-allocation=none",
            "--max-tries=10", "--retry-wait=30", "--allow-overwrite=true", "--auto-file-renaming=false",
-           "--summary-interval=0", "--console-log-level=warn", "--download-result=hide",
-           "-U", UA, "-d", str(dest.parent), "-o", dest.name]
+           "--summary-interval=0", "--show-console-readout=false", "--console-log-level=warn",
+           "--download-result=hide", "-U", ua, "-d", str(dest.parent), "-o", dest.name]
     if referer:
         cmd += [f"--referer={referer}"]
     control = dest.with_name(dest.name + ".aria2")
@@ -90,14 +90,14 @@ def download(url, dest, referer=None, size=None, attempts=30):
     raise RuntimeError(f"download failed: {url}")
 
 
-def curl(url, dest, referer=None, size=None, attempts=30):
+def curl(url, dest, referer=None, size=None, attempts=30, ua=UA):
     """Resumable download with curl; retries until the file is complete."""
     dest = Path(dest)
     if size and dest.exists() and dest.stat().st_size == size:
         return dest
     part = dest.with_name(dest.name + ".part")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["curl", "-fL", "-sS", "-C", "-", "-A", UA, "--connect-timeout", "30",
+    cmd = ["curl", "-fL", "-sS", "-C", "-", "-A", ua, "--connect-timeout", "30",
            "--speed-time", "120", "--speed-limit", "10000", "-o", str(part)]
     if referer:
         cmd += ["-e", referer]
@@ -258,7 +258,9 @@ def fetch_real_busbra():
     out = dataset_dir("real/busbra", big=False)
     st = State(out)
     if "BUSBRA.zip" not in st:
-        z = download("https://zenodo.org/api/records/8231412/files/BUSBRA.zip/content", out / "BUSBRA.zip")
+        # Zenodo answers 403 to browser-like user agents
+        z = download("https://zenodo.org/api/records/8231412/files/BUSBRA.zip/content", out / "BUSBRA.zip",
+                     ua="BreastSIM-fetch/0.1")
         unzip(z, out)
         z.unlink()
         st.add("BUSBRA.zip")
