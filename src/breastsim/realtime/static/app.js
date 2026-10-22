@@ -261,7 +261,8 @@ function buildChestWall() {
   add("chest:pleura", pleura);
   // torso skin around the breast base: a thin rounded slab at the chest-wall plane with a hole-free
   // look (the breast skin mesh covers the centre)
-  const torso = new THREE.Mesh(new RoundedBoxGeometry(ext, 2, ext, 2, 1), MESH_STYLE.skin());
+  const tsize = Math.max(U, V) * 1.25;
+  const torso = new THREE.Mesh(new RoundedBoxGeometry(tsize, 2, tsize, 2, 1), MESH_STYLE.skin());
   const tc = new Float32Array(torso.geometry.attributes.position.count * 3);
   for (let i = 0; i < tc.length; i += 3) tc.set(SKIN_RGB, i);
   torso.geometry.setAttribute("color", new THREE.BufferAttribute(tc, 3));
@@ -313,7 +314,8 @@ function applyVisibility() {
   three.guides.visible = $("showGuides").checked;
   three.guides.children.forEach((c) => { if (c.userData.lesion) c.visible = $("showLesions").checked; });
   const op = +$("skinOpacity").value;
-  ["skin", "torso"].forEach((k) => { if (three.meshes[k]) three.meshes[k].material.opacity = op; });
+  if (three.meshes.skin) three.meshes.skin.material.opacity = op;
+  if (three.meshes.torso) three.meshes.torso.material.opacity = op * 0.45;    // context only
 }
 
 function recenter(full) {
@@ -458,6 +460,7 @@ async function onLoaded(info) {
   syncAll();
   status(`${info.id} · ${info.description} · ${info.extent_mm.map((x) => x.toFixed(0)).join("×")} mm`);
   await loadMeshes();
+  status(`${info.id} · ${info.description} · ${info.extent_mm.map((x) => x.toFixed(0)).join("×")} mm`);
   hideLoading();
   refreshPhantomList();
   request();
