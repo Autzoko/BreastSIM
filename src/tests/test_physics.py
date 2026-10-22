@@ -114,3 +114,70 @@ def test_attenuation_slope_matches_spectral_theory():
     A, E, _, _ = spectral_attenuation_lut(PROBES["L11-5v"], 1.0)
     expect = np.polyfit(zz[sel], 10 * np.log10(np.interp(alpha * zz[sel] * 1e-3, A, E)), 1)[0]
     assert slope == pytest.approx(expect, rel=0.05)
+
+
+def sphere_in_fat(c_lesion=1560.0, alpha_lesion=None, radius=4.0, size=(40, 60, 60)):
+    """Round lesion 15 mm deep in fat (c 1440); lesion attenuation equals fat unless given."""
+    shape = tuple(int(s / VOX) for s in size)
+    a, u, v = np.meshgrid(*[np.arange(n) * VOX for n in shape], indexing="ij")
+    les = (a - (size[0] - 15)) ** 2 + (u - size[1] / 2) ** 2 + (v - size[2] / 2) ** 2 < radius ** 2
+    label = np.where(les, tissue.TUMOR, tissue.FAT).astype(np.uint8)
+    z = np.where(les, 1.47, 1.35).astype(np.float16)
+    c = np.where(les, c_lesion, 1440.0).astype(np.float16)
+    fat_alpha = 0.4 * tissue.NP_PER_M_PER_DB_PER_CM
+    al = np.where(les, fat_alpha if alpha_lesion is None else alpha_lesion, fat_alpha).astype(np.float16)
+    surface = np.full(shape[1:], size[0], np.float32)
+    return phantom.Volume("test/sphere", label, z, al, VOX, 1.0, surface, les.any(0), {}, c)
+
+
+def posterior_profile(vol, **kw):
+    r, _, meta, labels = render(vol, **kw)
+    inten = r.last_intensity.cpu().numpy()
+    rows, cols = np.nonzero(labels == tissue.TUMOR)
+    below = slice(rows.max() + int(2 / meta["px_z_mm"]), rows.max() + int(10 / meta["px_z_mm"]))
+    return 10 * np.log10(inten[below].mean(0)), cols, meta
+
+
+def test_refraction_edge_shadows_at_lesion_margins():
+    vol = sphere_in_fat()
+    prof, cols, meta = posterior_profile(vol)
+    prof_off, _, _ = posterior_profile(vol, edge_shadow_db=0.0)
+    px = meta["px_x_mm"]
+    edges = np.r_[cols.min() - int(0.5 / px):cols.min() + int(0.5 / px), cols.max() - int(0.5 / px):cols.max() + int(0.5 / px)]
+    far = np.r_[: cols.min() - int(6 / px), cols.max() + int(6 / px):]
+    # dark streaks behind the margins (same attenuation everywhere: pure refraction effect) ...
+    assert prof[edges].mean() < prof[far].mean() - 2.0
+    # ... that vanish when the boundary-transmission model is off
+    assert abs(prof_off[edges].mean() - prof_off[far].mean()) < 1.0
+
+
+def test_shadowing_lesion_darkens_posterior_region():
+    prof_none, cols, meta = posterior_profile(sphere_in_fat(c_lesion=1440.0), edge_shadow_db=0.0)
+    prof_sh, _, _ = posterior_profile(sphere_in_fat(c_lesion=1440.0, alpha_lesion=3.0 * tissue.NP_PER_M_PER_DB_PER_CM),
+                                      edge_shadow_db=0.0)
+    mid = slice(int(np.median(cols)) - 5, int(np.median(cols)) + 5)
+    assert prof_sh[mid].mean() < prof_none[mid].mean() - 10      # 3 dB/cm/MHz, 8 mm, 7.6 MHz: strong shadow
+
+
+def test_posterior_features_follow_dataset_frequencies():
+    lesions = [{"id": i, "type": tissue.NAMES[tissue.TUMOR]} for i in range(2000)]
+    phantom.lesion_acoustics("x/y", lesions)
+    again = phantom.lesion_acoustics("x/y", [{"id": i, "type": tissue.NAMES[tissue.TUMOR]} for i in range(2000)])
+    assert [l["posterior"] for l in lesions] == [l["posterior"] for l in again]     # deterministic
+    freq = {k: np.mean([l["posterior"] == k for l in lesions]) for k in tissue.POSTERIOR_FEATURE_PROBS[tissue.TUMOR]}
+    for k, pr in tissue.POSTERIOR_FEATURE_PROBS[tissue.TUMOR].items():
+        assert freq[k] == pytest.approx(pr, abs=0.04)
+    for l in lesions:
+        lo, hi = tissue.POSTERIOR_ATTENUATION_DB_CM_MHZ[l["posterior"]]
+        assert lo <= l["attenuation_db_cm_mhz"] <= hi
+
+
+def test_lesion_alpha_override():
+    from breastsim.realtime.renderer import lesion_alpha
+    vol = sphere_in_fat()
+    ids = (vol.label == tissue.TUMOR).astype(np.uint8)
+    vol.lesion_id = ids
+    vol.meta["lesions"] = [{"id": 0, "attenuation_db_cm_mhz": 2.0}]
+    a = lesion_alpha(vol)
+    assert np.allclose(a[ids == 1], 2.0 * tissue.NP_PER_M_PER_DB_PER_CM, rtol=1e-3)
+    assert np.allclose(a[ids == 0], vol.alpha[ids == 0].astype(np.float32))

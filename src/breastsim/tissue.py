@@ -55,16 +55,25 @@ DEFAULT_ACOUSTIC = {
 }
 DEFAULT_ALPHA_POWER = 1.2
 
-# Lesion attenuation slopes (dB/cm/MHz) drawn per lesion at cache build.
-# The VICTRE-derived phantoms assign tumors ~2.7 dB/cm/MHz^y (Li et al. 2021,
-# Park et al. 2025), about 3x published carcinoma values, which blackens the
-# whole shadow at 10+ MHz. Ranges from in-vitro/in-vivo breast compilations
-# (e.g. https://pmc.ncbi.nlm.nih.gov/articles/PMC1761921, table 5): carcinoma
-# ~0.6-1.2, fibroadenoma lower, simple cysts ~water.
-LESION_ATTENUATION_DB_CM_MHZ = {
-    TUMOR: (0.6, 1.2), NECROSIS: (0.4, 0.9), ANGIOGENESIS: (0.5, 1.0),
-    FIBROADENOMA: (0.3, 0.8), CYST: (0.0, 0.02),
+# BI-RADS posterior acoustic features, drawn per lesion (deterministic per
+# phantom and lesion) when a phantom is loaded. Frequencies from the BrEaST
+# annotations (checked 2026-10-22): malignant n=98 -> none 52 %, shadowing
+# 33 %, enhancement 10 %, combined 5 %; fibroadenoma n=30 -> none 67 %,
+# enhancement 20 %, combined 7 %, shadowing 7 %. Simple cysts enhance.
+# The VICTRE-derived phantoms give every tumour ~2.7 dB/cm/MHz^y (Li et al.
+# 2021), i.e. a black shadow behind all of them; clinically posterior
+# shadowing depends on the desmoplastic reaction and varies per lesion.
+POSTERIOR_FEATURE_PROBS = {
+    TUMOR: {"none": 0.52, "shadowing": 0.33, "enhancement": 0.10, "combined": 0.05},
+    FIBROADENOMA: {"none": 0.67, "enhancement": 0.20, "combined": 0.07, "shadowing": 0.06},
+    CYST: {"enhancement": 0.9, "none": 0.1},
 }
+# Lesion attenuation slope (dB/cm/MHz) realising each feature relative to
+# breast fat (~0.4) and glandular tissue (~0.75).
+POSTERIOR_ATTENUATION_DB_CM_MHZ = {
+    "shadowing": (1.8, 3.5), "combined": (1.0, 1.8), "none": (0.4, 0.8), "enhancement": (0.05, 0.3),
+}
+CYST_ATTENUATION_DB_CM_MHZ = (0.0, 0.05)        # fluid, whatever the drawn feature
 NP_PER_M_PER_DB_PER_CM = 100 / 8.686
 
 # Overlay colors (RGB) for label views.

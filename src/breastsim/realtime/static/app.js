@@ -28,6 +28,7 @@ const IMG_SLIDERS = [
   ["specular", "specular", 0, 100, 1],
   ["speckle_reduction", "smooth", 0, 3, 0.1],
   ["lateral_f_number", "F#", 1, 4, 0.1],
+  ["edge_shadow_db", "edge shadow", 0, 40, 1],
   ["shadow_blur_mm", "shadow fill", 0, 4, 0.1],
 ];
 const PRESET_KEYS = ["probe", "depth_mm", "px_x_mm", "px_z_mm", "gain_db", "dynamic_range_db",
@@ -364,7 +365,8 @@ async function onLoaded(info) {
 function renderLesions() {
   const L = S.info.lesions;
   $("lesions").innerHTML = L.length ? L.map((l) => `
-    <div class="lesion"><span><span class="t">#${l.id} ${l.type}</span> · Ø ${l.diameter_mm} mm</span>
+    <div class="lesion"><span><span class="t">#${l.id} ${l.type}</span> · Ø ${l.diameter_mm} mm` +
+      `${l.posterior ? ` · posterior: ${l.posterior} (${l.attenuation_db_cm_mhz} dB/cm/MHz)` : ""}</span>
       <button data-id="${l.id}">Go</button>
       <span class="muted">${l.parts.length > 1 ? l.parts.join(" + ") + " · " : ""}a ${l.center_mm[0].toFixed(0)} · u ${l.center_mm[1].toFixed(0)} · v ${l.center_mm[2].toFixed(0)} mm` +
       `${l.depth_below_skin_mm != null ? ` · ${l.depth_below_skin_mm} mm deep` : ""}</span></div>`).join("")

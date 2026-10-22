@@ -24,7 +24,7 @@ import numpy as np
 from . import paths, tissue
 
 PREVIEW_VOXEL_MM = 0.2
-CACHE_VERSION = 3   # bump to rebuild caches after changing the conversion
+CACHE_VERSION = 4   # bump to rebuild caches after changing the conversion
 WATER_Z, WATER_ALPHA, WATER_C = 1.5, 0.025, 1500.0
 
 # Li et al. 2021, power-law exponent per BI-RADS type.
@@ -52,6 +52,7 @@ class Volume:
     lesion_proj: np.ndarray = None   # (U, V) bool, lesion present along A
     meta: dict = field(default_factory=dict)
     c: np.ndarray = None              # speed of sound, m/s (float16)
+    lesion_id: np.ndarray = None      # uint8, lesion index + 1 inside lesions, 0 elsewhere
 
     @property
     def extent_mm(self):
@@ -216,23 +217,25 @@ def canonicalize(label, z, alpha, c=None, margin=4):
     return (*out, {"axis_order": order, "flip": bool(flip), "crop_lo": lo})
 
 
-def apply_lesion_attenuation(label, alpha, lesions, pid, voxel):
-    """Replace phantom lesion attenuation by per-lesion draws from literature ranges
-    (tissue.LESION_ATTENUATION_DB_CM_MHZ), deterministic per phantom and lesion."""
+def lesion_acoustics(pid, lesions):
+    """Per-lesion posterior feature and attenuation slope, deterministic per phantom/lesion.
+
+    Drawn at load time (not cached) from tissue.POSTERIOR_FEATURE_PROBS, so the
+    distribution can be tuned without rebuilding caches. Adds "posterior" and
+    "attenuation_db_cm_mhz" to each lesion dict.
+    """
     import zlib
+    codes = {v: k for k, v in tissue.NAMES.items()}
     for les in lesions:
         rng = np.random.default_rng(zlib.crc32(f"{pid}#{les['id']}".encode()))
-        draw = rng.random()            # one quantile per lesion: all its parts move together
-        sl = tuple(slice(int(a / voxel), int(np.ceil(b / voxel)) + 1) for a, b in les["bbox_mm"])
-        sub_l, sub_a = label[sl], alpha[sl]
-        chosen = {}
-        for lab, (lo, hi) in tissue.LESION_ATTENUATION_DB_CM_MHZ.items():
-            m = sub_l == lab
-            if m.any():
-                db = lo + draw * (hi - lo)
-                sub_a[m] = db * tissue.NP_PER_M_PER_DB_PER_CM
-                chosen[tissue.NAMES[lab]] = round(db, 3)
-        les["attenuation_db_cm_mhz"] = chosen
+        main = codes.get(les["type"], tissue.TUMOR)
+        probs = tissue.POSTERIOR_FEATURE_PROBS.get(main, tissue.POSTERIOR_FEATURE_PROBS[tissue.TUMOR])
+        feats = list(probs)
+        feat = feats[rng.choice(len(feats), p=np.array(list(probs.values())) / sum(probs.values()))]
+        lo, hi = tissue.CYST_ATTENUATION_DB_CM_MHZ if main == tissue.CYST else tissue.POSTERIOR_ATTENUATION_DB_CM_MHZ[feat]
+        les["posterior"] = feat
+        les["attenuation_db_cm_mhz"] = round(float(lo + rng.random() * (hi - lo)), 3)
+    return lesions
 
 
 def _surface(label, voxel):
@@ -244,17 +247,22 @@ def _surface(label, voxel):
     return surf
 
 
-def find_lesions(label, voxel, min_voxels=8):
-    """Connected lesion components: type, centroid (a, u, v) mm, size."""
+def find_lesions(label, voxel, min_voxels=8, return_ids=False):
+    """Connected lesion components: type, centroid (a, u, v) mm, size.
+
+    With return_ids, also returns a uint8 volume holding lesion id + 1 (0 elsewhere)."""
     from scipy import ndimage
     mask = np.isin(label, tissue.LESIONS)
     comps, n = ndimage.label(mask, structure=np.ones((3, 3, 3)))
     out = []
+    ids = np.zeros(label.shape, np.uint8) if return_ids else None
     for i, sl in enumerate(ndimage.find_objects(comps), 1):
         sub = comps[sl] == i
         nvox = int(sub.sum())
-        if nvox < min_voxels:
+        if nvox < min_voxels or len(out) >= 254:
             continue
+        if return_ids:
+            ids[sl][sub] = len(out) + 1
         idx = np.argwhere(sub) + [s.start for s in sl]
         labs, cnt = np.unique(label[sl][sub], return_counts=True)
         kinds = [tissue.NAMES[int(l)] for l in labs[np.argsort(-cnt)]]
@@ -265,7 +273,7 @@ def find_lesions(label, voxel, min_voxels=8):
             "bbox_mm": [[float(s.start * voxel), float(s.stop * voxel)] for s in sl],
             "volume_mm3": round(vol_mm3, 1), "diameter_mm": round((6 * vol_mm3 / np.pi) ** (1 / 3), 2),
         })
-    return out
+    return (out, ids) if return_ids else out
 
 
 def _mesh(mask, voxel, factor, sigma=1.0):
@@ -303,7 +311,7 @@ def cache_dir(pid):
     return paths.CACHE / "preview" / pid.replace("/", "__")
 
 
-def build_cache(pid, log=print, lesion_attenuation="literature"):
+def build_cache(pid, log=print):
     info = get_info(pid)
     t0 = time.time()
     log(f"[phantom] {pid}: [1/4] reading source files ({info.source})")
@@ -311,9 +319,7 @@ def build_cache(pid, log=print, lesion_attenuation="literature"):
     log(f"[phantom] {pid}: [2/4] reorienting and writing preview volume")
     label, z, alpha, c, ori = canonicalize(label, z, alpha, c)
     log(f"[phantom] {pid}: [3/4] finding lesions")
-    lesions = find_lesions(label, voxel)
-    if lesion_attenuation == "literature":
-        apply_lesion_attenuation(label, alpha, lesions, pid, voxel)
+    lesions, lesion_id = find_lesions(label, voxel, return_ids=True)
     out = cache_dir(pid)
     out.mkdir(parents=True, exist_ok=True)
     (out / "meta.json").unlink(missing_ok=True)   # meta.json last = cache complete
@@ -321,6 +327,7 @@ def build_cache(pid, log=print, lesion_attenuation="literature"):
     np.save(out / "z.npy", z.astype(np.float16))
     np.save(out / "alpha.npy", alpha.astype(np.float16))
     np.save(out / "c.npy", c.astype(np.float16))
+    np.save(out / "lesion_id.npy", lesion_id)
     np.save(out / "surface.npy", _surface(label, voxel))
     np.save(out / "lesion_proj.npy", np.isin(label, tissue.LESIONS).any(axis=0))
     log(f"[phantom] {pid}: [4/4] building 3D surfaces")
@@ -334,7 +341,6 @@ def build_cache(pid, log=print, lesion_attenuation="literature"):
             "mean_z": {int(l): float(z[label == l].mean()) for l in labels},
             "mean_alpha": {int(l): float(alpha[label == l].mean()) for l in labels},
             "mean_c": {int(l): float(c[label == l].mean()) for l in labels},
-            "lesion_attenuation": lesion_attenuation,
             "lesions": lesions, "meshes": {k: [len(v[0]), len(v[1])] for k, v in meshes.items()},
             "built": time.strftime("%Y-%m-%d %H:%M:%S"), "build_seconds": round(time.time() - t0, 1)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
@@ -374,9 +380,10 @@ def load(pid, log=print):
     d = cache_dir(pid)
     ensure_cache(pid, log)
     meta = json.loads((d / "meta.json").read_text())
+    lesion_acoustics(pid, meta["lesions"])
     return Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
                   meta["voxel_mm"], meta["alpha_power"], np.load(d / "surface.npy"),
-                  np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"))
+                  np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"), np.load(d / "lesion_id.npy"))
 
 
 def load_meshes(pid):
