@@ -35,7 +35,7 @@ class ImagingParams:
     specular: float = 12.0            # weight of impedance-boundary echoes
     lateral_f_number: float = 2.0     # minimum receive F-number
     overlay: str = "contour"          # none | contour | labels
-    elevation_samples: int = 24
+    elevation_samples: int = 16
     seed: int = 0
 
 
