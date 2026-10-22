@@ -9,7 +9,7 @@ source. Amplitudes are later scaled by tissue echogenicity.
 """
 import torch
 
-SCATTER_CELL_MM = 0.08
+SCATTER_CELL_MM = 0.1   # ~10 scatterers per resolution cell at 10-12 MHz
 _M32 = 0xFFFFFFFF
 
 
@@ -28,16 +28,38 @@ def _uniform(h):
     return (h.to(torch.float32) + 0.5) / 4294967296.0  # float32: MPS has no float64
 
 
+_KEY_BITS, _KEY_OFF = 20, 1 << 19     # +-2^19 cells per axis (+-52 m at 0.1 mm)
+
+
+def cell_index(points, cell=SCATTER_CELL_MM):
+    """Integer cell index (..., 3) of each point (mm)."""
+    return torch.floor(points.float() / cell).to(torch.int64)
+
+
+def unique_cells(points, cell=SCATTER_CELL_MM):
+    """Distinct cells hit by a cloud of points: (N, 3) int64 indices."""
+    idx = cell_index(points.reshape(-1, 3), cell) + _KEY_OFF
+    key = (idx[:, 0] << (2 * _KEY_BITS)) | (idx[:, 1] << _KEY_BITS) | idx[:, 2]
+    key = torch.unique(key)
+    mask = (1 << _KEY_BITS) - 1
+    return torch.stack([key >> (2 * _KEY_BITS), (key >> _KEY_BITS) & mask, key & mask], -1) - _KEY_OFF
+
+
+def from_index(idx, cell=SCATTER_CELL_MM, seed=0):
+    """Scatterer (amplitude (...,), position (..., 3) mm) of each cell index."""
+    ix, iy, iz = idx.unbind(-1)
+    u1 = _uniform(_hash(ix, iy, iz, seed, 1))
+    u2 = _uniform(_hash(ix, iy, iz, seed, 2))
+    amp = torch.sqrt(-2 * torch.log(u1)) * torch.cos(2 * torch.pi * u2)
+    # keep the scatterer strictly inside its cell despite float32 rounding
+    jitter = 0.001 + 0.998 * torch.stack([_uniform(_hash(ix, iy, iz, seed, 3 + k)) for k in range(3)], -1)
+    return amp, (idx.to(torch.float32) + jitter) * cell
+
+
 def cells(points, cell=SCATTER_CELL_MM, seed=0):
     """Scatterer of the cell containing each point.
 
     points: (..., 3) float tensor, mm. Returns (amplitude (...,), position (..., 3) mm).
     """
-    idx = torch.floor(points.float() / cell).to(torch.int64)
-    ix, iy, iz = idx.unbind(-1)
-    u1 = _uniform(_hash(ix, iy, iz, seed, 1))
-    u2 = _uniform(_hash(ix, iy, iz, seed, 2))
-    amp = torch.sqrt(-2 * torch.log(u1)) * torch.cos(2 * torch.pi * u2)
-    jitter = torch.stack([_uniform(_hash(ix, iy, iz, seed, 3 + k)) for k in range(3)], -1)
-    pos = (idx.to(torch.float32) + jitter) * cell
+    amp, pos = from_index(cell_index(points, cell), cell, seed)
     return amp.to(points.dtype), pos.to(points.dtype)

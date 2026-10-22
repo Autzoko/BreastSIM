@@ -44,7 +44,7 @@ class ImagingParams:
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
     conform: bool = True              # probe presses the skin flat
     overlay: str = "contour"          # none | contour | labels
-    elevation_samples: int = 16
+    elevation_samples: int = 5        # impedance planes across the elevation beam (specular term)
     preset: str = DEFAULT_PRESET
 
     @classmethod
@@ -105,6 +105,60 @@ class PreviewRenderer:
         out = F.grid_sample(volume, g, mode=mode, padding_mode="border", align_corners=True)
         return out.reshape(volume.shape[1], *shape)
 
+    # ------------------------------------------------------------ speckle
+    def _speckle(self, origin, axes, offs, nx, nz, dx, width, sigma_y, k2, max_points=8_000_000):
+        """Sum of every lattice scatterer inside the elevation beam, binned to pixels.
+
+        Each scatterer is counted once, weighted by the elevation beam profile at
+        its true elevation and phased by its true depth along its line, so a
+        small probe move changes the image smoothly (correct frame-to-frame
+        speckle correlation). Returns complex (nz, nx), unit variance for
+        echogenicity 1.
+        """
+        dev, cell = self.device, scatter.SCATTER_CELL_MM
+        e_lat, e_ax, e_el = axes
+        step = cell / np.sqrt(2)                       # dense enough to hit (nearly) every cell
+        depth = nz * self.DZ_MM
+        ny_max = 2 * float(sigma_y(torch.linspace(0, depth, 64, device=dev)).max()) + cell
+        slab = 2 * ny_max * (width + 2 * cell)         # mm^2 per mm of depth
+        chunk = max(1.0, max_points * step ** 3 / slab)
+        xs = torch.arange(-width / 2 - cell, width / 2 + cell, step, device=dev)
+        x_cols = torch.linspace(-width / 2, width / 2, nx, device=dev)
+        xs_off = torch.from_numpy(np.interp(xs.cpu().numpy(), x_cols.cpu().numpy(), offs.cpu().numpy())).to(dev, torch.float32)
+        re = torch.zeros(nz * nx, device=dev)
+        im = torch.zeros(nz * nx, device=dev)
+        z0 = 0.0
+        while z0 < depth:
+            z1 = min(depth, z0 + chunk)
+            zs = torch.arange(max(-cell, z0 - cell), z1 + cell, step, device=dev)
+            ys = torch.arange(-ny_max, ny_max + step, step, device=dev)
+            Z, X, Y = torch.meshgrid(zs, torch.arange(len(xs), device=dev, dtype=zs.dtype), ys, indexing="ij")
+            keep = Y.abs() <= 2 * sigma_y(Z.clamp(min=0)) + cell
+            Z, X, Y = Z[keep], X[keep].long(), Y[keep]
+            pts = origin + xs[X, None] * e_lat + (Z + xs_off[X])[:, None] * e_ax + Y[:, None] * e_el
+            idx = scatter.unique_cells(pts, cell)
+            del pts, Z, X, Y, keep
+            amp, pos = scatter.from_index(idx, cell, self.seed)
+            rel = pos - origin
+            col = torch.round((rel @ e_lat + width / 2) / dx).long()
+            ok = (col >= 0) & (col < nx)
+            col, rel, amp, pos = col[ok], rel[ok], amp[ok], pos[ok]
+            zd = rel @ e_ax - offs[col]                                     # depth along its own line
+            row = torch.floor(zd / self.DZ_MM).long()
+            ok = (zd >= z0) & (zd < z1) & (row >= 0) & (row < nz)           # each scatterer in one chunk
+            col, row, zd, amp, pos, yv = col[ok], row[ok], zd[ok], amp[ok], pos[ok], (rel @ e_el)[ok]
+            w = torch.exp(-0.5 * (yv / sigma_y(zd)) ** 2)
+            echo = self.echo_lut[self._sample(self._labels, pos, "nearest")[0].long()]
+            val = w * echo * amp
+            flat = row * nx + col
+            re.index_add_(0, flat, val * torch.cos(k2 * zd))
+            im.index_add_(0, flat, val * torch.sin(k2 * zd))
+            z0 = z1
+        zc = (torch.arange(nz, device=dev, dtype=torch.float32) + 0.5) * self.DZ_MM
+        # expected scatterers per pixel x integral of w^2 over elevation (sigma sqrt(pi))
+        norm = torch.sqrt(dx * self.DZ_MM / cell ** 3 * sigma_y(zc) * np.sqrt(np.pi))
+        return torch.complex(re, im).reshape(nz, nx) / norm[:, None]
+
     # ------------------------------------------------------------- render
     @torch.no_grad()
     def render(self, pose: ProbePose, p: ImagingParams):
@@ -130,28 +184,23 @@ class PreviewRenderer:
         plane = origin + x[None, :, None] * e_lat + zt[..., None] * e_ax          # (nz, nx, 3)
 
         # two-way elevation beam width (diffraction at focus, geometric off focus)
-        fwhm_y = torch.sqrt((lam * zf / h_el) ** 2 + (h_el * (1 - z / zf)) ** 2) / np.sqrt(2)
-        sig_y = (fwhm_y / 2.355)[:, None]                                         # (nz, 1)
+        def sigma_y(depth):
+            return torch.sqrt((lam * zf / h_el) ** 2 + (h_el * (1 - depth / zf)) ** 2) / np.sqrt(2) / 2.355
 
         k2 = 4 * np.pi / lam                                                      # 2k, rad/mm
-        speckle = torch.zeros(nz, nx, dtype=torch.complex64, device=dev)
+        speckle = self._speckle(origin, (e_lat, e_ax, e_el), offs, nx, nz, dx, width, sigma_y, k2)
+
+        # specular echoes: axial impedance change, averaged over the elevation beam
+        sig_y = sigma_y(z)[:, None]
         refl = torch.zeros(nz, nx, device=dev)
-        ts = torch.linspace(-2.5, 2.5, p.elevation_samples, device=dev)
+        ts = torch.linspace(-1.5, 1.5, max(1, p.elevation_samples), device=dev)
         ws = torch.exp(-0.5 * ts ** 2)
         d = 2  # samples, impedance difference half-span (0.1 mm)
-        line_start = (origin @ e_ax) + offs                                       # per-line phase reference
         for t, w in zip(ts, ws):
-            pts = plane + (t * sig_y)[..., None] * e_el
-            lab = self._sample(self._labels, pts, "nearest")[0]
-            imp = self._sample(self._props[:, :1], pts, "bilinear")[0]
-            amp, pos = scatter.cells(pts, seed=self.seed)
-            depth = pos @ e_ax - line_start[None]
-            echo = self.echo_lut[lab.long()] * amp
-            speckle += w * echo * torch.polar(torch.ones_like(depth), k2 * depth)
+            imp = self._sample(self._props[:, :1], plane + (t * sig_y)[..., None] * e_el, "bilinear")[0]
             zp = torch.cat([imp[d:], imp[-1:].expand(d, -1)])
             zm = torch.cat([imp[:1].expand(d, -1), imp[:-d]])
             refl += w * (zp - zm) / (zp + zm)
-        speckle /= torch.sqrt((ws ** 2).sum())
         refl /= ws.sum()
         rf = speckle + p.specular * refl * torch.polar(torch.ones_like(z), k2 * z)[:, None]
 
