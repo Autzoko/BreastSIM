@@ -1,0 +1,116 @@
+"""Physics checks of the preview imaging model on simple layered phantoms."""
+import numpy as np
+import pytest
+import torch
+
+from breastsim import phantom, tissue
+from breastsim.probe import PROBES, ProbePose
+from breastsim.realtime.renderer import ImagingParams, PreviewRenderer, spectral_attenuation_lut
+
+VOX = 0.2
+
+
+def layered(top_label, bottom_label, boundary_mm, c_top=1540.0, c_bottom=1540.0, z_top=1.40, z_bottom=1.60,
+            alpha=0.0, size=(40, 60, 60)):
+    """Two flat layers; skin surface at a = size[0], boundary `boundary_mm` below it."""
+    shape = tuple(int(s / VOX) for s in size)
+    a = np.arange(shape[0]) * VOX
+    deep = (size[0] - a) > boundary_mm
+    label = np.where(deep, bottom_label, top_label)[:, None, None].repeat(shape[1], 1).repeat(shape[2], 2).astype(np.uint8)
+    z = np.where(label == top_label, z_top, z_bottom).astype(np.float16)
+    c = np.where(label == top_label, c_top, c_bottom).astype(np.float16)
+    al = np.full(shape, alpha, np.float16)
+    surface = np.full(shape[1:], size[0], np.float32)
+    return phantom.Volume("test/layers", label, z, al, VOX, 1.0, surface, np.zeros(shape[1:], bool), {}, c)
+
+
+def render(vol, preset="l11_5v", echo=True, **kw):
+    r = PreviewRenderer("cpu")
+    r.set_volume(vol)
+    if not echo:
+        r.echo_lut.zero_()                       # specular term only
+    pose_kw = kw.pop("pose", {})
+    p = ImagingParams.from_preset(preset, overlay="none", speckle_reduction=0, conform=False,
+                                  tgc_db_cm_mhz=0, shadow_blur_mm=0, **kw)
+    pose = ProbePose(u=vol.label.shape[1] * VOX / 2, v=vol.label.shape[2] * VOX / 2, **pose_kw)
+    img, meta, labels = r.render(pose, p)
+    return r, img, meta, labels
+
+
+def boundary_level(r, meta, ref_rows):
+    """Peak boundary echo amplitude in units of the unit-speckle rms."""
+    inten = r.last_intensity.cpu().numpy()
+    prof = np.sqrt(inten[:, inten.shape[1] // 4: 3 * inten.shape[1] // 4].mean(1))
+    return prof.max(), prof
+
+
+def specular_to_speckle(preset, px):
+    """Boundary peak / glandular speckle rms, rendered at a fine output grid."""
+    vol = layered(tissue.FAT, tissue.GLAND, 15.0)
+    r, _, _, _ = render(vol, preset, echo=False, specular=30.0, px_x_mm=px, px_z_mm=px)
+    peak, _ = boundary_level(r, None, None)
+    r2, _, _, _ = render(layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6), preset,
+                         px_x_mm=px, px_z_mm=px)
+    return peak / np.sqrt(r2.last_intensity.cpu().numpy()[int(5 / px):int(25 / px)].mean())
+
+
+def test_specular_amplitude_is_probe_independent():
+    # same boundary (R = 0.0667) imaged by a 7.6 MHz and a 10 MHz probe
+    lo, hi = specular_to_speckle("l11_5v", 0.02), specular_to_speckle("busi", 0.02)
+    R = (1.60 - 1.40) / (1.60 + 1.40)
+    assert hi / lo == pytest.approx(1.0, abs=0.15)
+    for v in (lo, hi):                       # nominal: specular * R speckle-rms units
+        assert v == pytest.approx(30.0 * R, rel=0.25)
+
+
+def test_specular_falls_off_with_incidence_angle():
+    vol = layered(tissue.FAT, tissue.GLAND, 15.0)
+    r0, _, _, _ = render(vol, echo=False)
+    p0, _ = boundary_level(r0, None, None)
+    r1, _, _, _ = render(vol, echo=False, pose={"rock": 20.0})
+    p1, _ = boundary_level(r1, None, None)
+    assert 20 * np.log10(p1 / p0) < -8          # oblique smooth boundary reflects away from the aperture
+
+
+def test_spectral_attenuation_lut_matches_gaussian_theory():
+    spec = PROBES["L12-hf"]
+    A, E, fbar, sf = spectral_attenuation_lut(spec, power=1.0)
+    fc = spec.fc / 1e6
+    s_amp = spec.bandwidth * fc / 2.355
+    assert E[0] == pytest.approx(1.0) and fbar[0] == pytest.approx(fc, rel=1e-3)
+    # |S|^2 exp(-4 A f) with Gaussian |S|^2 of variance s_amp^2/2: centroid fc - 2 A s_amp^2, exact for y = 1
+    i = np.searchsorted(A, 0.1)
+    assert fbar[i] == pytest.approx(fc - 2 * A[i] * s_amp ** 2, rel=0.01)
+    # energy loss is smaller than the centre-frequency estimate exp(-4 A fc)
+    assert E[i] > np.exp(-4 * A[i] * fc)
+    assert np.all(np.diff(fbar) < 0) and np.all(np.diff(E) < 0)
+
+
+def test_speed_of_sound_moves_boundaries_like_a_scanner():
+    # 10 mm of slow fat (1440 m/s) over gland: the beamformer (1540 m/s) shows the boundary at 10 * 1540/1440 mm
+    vol = layered(tissue.FAT, tissue.GLAND, 10.0, c_top=1440.0, c_bottom=1540.0)
+    _, _, meta, labels = render(vol)
+    col = labels[:, labels.shape[1] // 2]
+    row = np.argmax(col == tissue.GLAND)
+    assert row * meta["px_z_mm"] == pytest.approx(10.0 * 1540 / 1440, abs=0.15)
+
+
+def test_output_speckle_is_rayleigh():
+    vol = layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6)
+    r, _, meta, _ = render(vol)
+    env = np.sqrt(r.last_intensity.cpu().numpy())
+    w = env[int(10 / meta["px_z_mm"]):int(30 / meta["px_z_mm"]), 60:-60]
+    assert w.mean() / w.std() == pytest.approx(1.91, rel=0.1)
+
+
+def test_attenuation_slope_matches_spectral_theory():
+    alpha = 0.5 * 100 / 8.686                    # 0.5 dB/cm/MHz, y = 1, in Np/m/MHz
+    vol = layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6, alpha=alpha)
+    r, _, meta, _ = render(vol)
+    inten = r.last_intensity.cpu().numpy()
+    zz = (np.arange(inten.shape[0]) + 0.5) * meta["px_z_mm"]
+    sel = (zz > 5) & (zz < 35)
+    slope = np.polyfit(zz[sel], 10 * np.log10(inten.mean(1))[sel], 1)[0]
+    A, E, _, _ = spectral_attenuation_lut(PROBES["L11-5v"], 1.0)
+    expect = np.polyfit(zz[sel], 10 * np.log10(np.interp(alpha * zz[sel] * 1e-3, A, E)), 1)[0]
+    assert slope == pytest.approx(expect, rel=0.05)

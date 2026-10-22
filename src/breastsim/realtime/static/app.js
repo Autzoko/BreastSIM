@@ -25,7 +25,7 @@ const IMG_SLIDERS = [
   ["gain_db", "gain dB", -40, 20, 1],
   ["dynamic_range_db", "DR dB", 30, 80, 1],
   ["tgc_db_cm_mhz", "TGC", 0, 1.5, 0.05],
-  ["specular", "specular", 0, 40, 1],
+  ["specular", "specular", 0, 100, 1],
   ["speckle_reduction", "smooth", 0, 3, 0.1],
   ["lateral_f_number", "F#", 1, 4, 0.1],
   ["shadow_blur_mm", "shadow fill", 0, 4, 0.1],

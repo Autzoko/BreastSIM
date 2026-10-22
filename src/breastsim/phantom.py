@@ -24,8 +24,8 @@ import numpy as np
 from . import paths, tissue
 
 PREVIEW_VOXEL_MM = 0.2
-CACHE_VERSION = 2   # bump to rebuild caches after changing the conversion
-WATER_Z, WATER_ALPHA = 1.5, 0.025
+CACHE_VERSION = 3   # bump to rebuild caches after changing the conversion
+WATER_Z, WATER_ALPHA, WATER_C = 1.5, 0.025, 1500.0
 
 # Li et al. 2021, power-law exponent per BI-RADS type.
 USCT_ALPHA_POWER = {"A": 1.1151, "B": 1.1642, "C": 1.2563, "D": 1.3635}
@@ -51,6 +51,7 @@ class Volume:
     surface: np.ndarray = None       # (U, V) skin height along A in mm, NaN outside
     lesion_proj: np.ndarray = None   # (U, V) bool, lesion present along A
     meta: dict = field(default_factory=dict)
+    c: np.ndarray = None              # speed of sound, m/s (float16)
 
     @property
     def extent_mm(self):
@@ -138,10 +139,9 @@ def _load_usct(info):
     label = _downsample_labels(_read(info.files["label"], "label"), k)
     c = _block_mean(_read(info.files["sos"], "sos"), k)
     z = c * _block_mean(_read(info.files["density"], "density"), k) / 1e6
-    del c
     alpha = _block_mean(_read(info.files["aa"], "aa"), k)
     t = info.id.split("/")[1]
-    return label, z, alpha, voxel * k, USCT_ALPHA_POWER.get(t, tissue.DEFAULT_ALPHA_POWER)
+    return label, z, alpha, c, voxel * k, USCT_ALPHA_POWER.get(t, tissue.DEFAULT_ALPHA_POWER)
 
 
 def _load_oat64(info):
@@ -155,10 +155,9 @@ def _load_oat64(info):
     with h5py.File(info.files["acou"], "r") as h:
         c = _block_mean(h["sound_speed"][()], k) * 1e3                    # mm/us -> m/s
         z = c * _block_mean(h["density"][()], k) * 1e6 / 1e6              # g/mm^3 -> kg/m^3, -> MRayl
-        del c
         alpha = _block_mean(h["alpha_coeff"][()], k) * 1e3 / 8.686       # dB/(MHz^y mm) -> Np/(m MHz^y)
         power = float(np.array(h["alpha_power"]).ravel()[0])
-    return label, z, alpha, voxel * k, power
+    return label, z, alpha, c, voxel * k, power
 
 
 def _load_oab(info):
@@ -167,7 +166,7 @@ def _load_oab(info):
     for src, dst in OA_BREAST_LABELS.items():
         label[phan == src] = dst
     c, rho, a = (tissue.lut({k: v[i] for k, v in tissue.DEFAULT_ACOUSTIC.items()}) for i in range(3))
-    return label, c[label] * rho[label] / 1e6, a[label], 0.2, tissue.DEFAULT_ALPHA_POWER
+    return label, c[label] * rho[label] / 1e6, a[label], c[label], 0.2, tissue.DEFAULT_ALPHA_POWER
 
 
 LOADERS = {"usct": _load_usct, "oat64": _load_oat64, "oab": _load_oab}
@@ -194,24 +193,46 @@ def _orient(label):
     return order, flip
 
 
-def canonicalize(label, z, alpha, margin=4):
+def canonicalize(label, z, alpha, c=None, margin=4):
+    """Reorder to (A, U, V) with the chest wall at A=0, crop, pad with water.
+
+    Returns (label, z, alpha, ori), or (label, z, alpha, c, ori) when c is given.
+    """
     order, flip = _orient(label)
-    arrs = [np.transpose(a, order) for a in (label, z, alpha)]
+    fields = [(label, 0), (z, WATER_Z), (alpha, WATER_ALPHA)] + ([(c, WATER_C)] if c is not None else [])
+    arrs = [np.transpose(a, order) for a, _ in fields]
     if flip:
         arrs = [a[::-1] for a in arrs]
     nz = np.nonzero(arrs[0] > 0)
     lo = [max(0, int(i.min()) - margin) for i in nz]
     hi = [int(i.max()) + 1 + margin for i in nz]
     sl = tuple(slice(a, b) for a, b in zip(lo, hi))
-    label, z, alpha = (np.ascontiguousarray(a[sl]) for a in arrs)
     # pad so the nipple end and the sides are surrounded by water
     pad = [(0, margin)] + [(margin, margin)] * 2
-    label = np.pad(label, pad)
-    z = np.pad(z, pad, constant_values=WATER_Z)
-    alpha = np.pad(alpha, pad, constant_values=WATER_ALPHA)
-    water = label == tissue.BACKGROUND
-    z[water], alpha[water] = WATER_Z, WATER_ALPHA
-    return label, z, alpha, {"axis_order": order, "flip": bool(flip), "crop_lo": lo}
+    out = [np.pad(np.ascontiguousarray(a[sl]), pad, constant_values=w) for a, (_, w) in zip(arrs, fields)]
+    water = out[0] == tissue.BACKGROUND
+    for a, (_, w) in zip(out[1:], fields[1:]):
+        a[water] = w
+    return (*out, {"axis_order": order, "flip": bool(flip), "crop_lo": lo})
+
+
+def apply_lesion_attenuation(label, alpha, lesions, pid, voxel):
+    """Replace phantom lesion attenuation by per-lesion draws from literature ranges
+    (tissue.LESION_ATTENUATION_DB_CM_MHZ), deterministic per phantom and lesion."""
+    import zlib
+    for les in lesions:
+        rng = np.random.default_rng(zlib.crc32(f"{pid}#{les['id']}".encode()))
+        draw = rng.random()            # one quantile per lesion: all its parts move together
+        sl = tuple(slice(int(a / voxel), int(np.ceil(b / voxel)) + 1) for a, b in les["bbox_mm"])
+        sub_l, sub_a = label[sl], alpha[sl]
+        chosen = {}
+        for lab, (lo, hi) in tissue.LESION_ATTENUATION_DB_CM_MHZ.items():
+            m = sub_l == lab
+            if m.any():
+                db = lo + draw * (hi - lo)
+                sub_a[m] = db * tissue.NP_PER_M_PER_DB_PER_CM
+                chosen[tissue.NAMES[lab]] = round(db, 3)
+        les["attenuation_db_cm_mhz"] = chosen
 
 
 def _surface(label, voxel):
@@ -282,23 +303,26 @@ def cache_dir(pid):
     return paths.CACHE / "preview" / pid.replace("/", "__")
 
 
-def build_cache(pid, log=print):
+def build_cache(pid, log=print, lesion_attenuation="literature"):
     info = get_info(pid)
     t0 = time.time()
     log(f"[phantom] {pid}: [1/4] reading source files ({info.source})")
-    label, z, alpha, voxel, power = LOADERS[info.source](info)
+    label, z, alpha, c, voxel, power = LOADERS[info.source](info)
     log(f"[phantom] {pid}: [2/4] reorienting and writing preview volume")
-    label, z, alpha, ori = canonicalize(label, z, alpha)
+    label, z, alpha, c, ori = canonicalize(label, z, alpha, c)
+    log(f"[phantom] {pid}: [3/4] finding lesions")
+    lesions = find_lesions(label, voxel)
+    if lesion_attenuation == "literature":
+        apply_lesion_attenuation(label, alpha, lesions, pid, voxel)
     out = cache_dir(pid)
     out.mkdir(parents=True, exist_ok=True)
     (out / "meta.json").unlink(missing_ok=True)   # meta.json last = cache complete
     np.save(out / "label.npy", label)
     np.save(out / "z.npy", z.astype(np.float16))
     np.save(out / "alpha.npy", alpha.astype(np.float16))
+    np.save(out / "c.npy", c.astype(np.float16))
     np.save(out / "surface.npy", _surface(label, voxel))
     np.save(out / "lesion_proj.npy", np.isin(label, tissue.LESIONS).any(axis=0))
-    log(f"[phantom] {pid}: [3/4] finding lesions")
-    lesions = find_lesions(label, voxel)
     log(f"[phantom] {pid}: [4/4] building 3D surfaces")
     meshes = build_meshes(label, voxel, lesions)
     np.savez_compressed(out / "meshes.npz", **{f"{k}_{p}": a for k, va in meshes.items()
@@ -309,6 +333,8 @@ def build_cache(pid, log=print):
             "labels": {int(l): int(c) for l, c in zip(labels, counts)},
             "mean_z": {int(l): float(z[label == l].mean()) for l in labels},
             "mean_alpha": {int(l): float(alpha[label == l].mean()) for l in labels},
+            "mean_c": {int(l): float(c[label == l].mean()) for l in labels},
+            "lesion_attenuation": lesion_attenuation,
             "lesions": lesions, "meshes": {k: [len(v[0]), len(v[1])] for k, v in meshes.items()},
             "built": time.strftime("%Y-%m-%d %H:%M:%S"), "build_seconds": round(time.time() - t0, 1)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
@@ -350,7 +376,7 @@ def load(pid, log=print):
     meta = json.loads((d / "meta.json").read_text())
     return Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
                   meta["voxel_mm"], meta["alpha_power"], np.load(d / "surface.npy"),
-                  np.load(d / "lesion_proj.npy"), meta)
+                  np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"))
 
 
 def load_meshes(pid):

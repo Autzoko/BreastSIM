@@ -55,6 +55,18 @@ DEFAULT_ACOUSTIC = {
 }
 DEFAULT_ALPHA_POWER = 1.2
 
+# Lesion attenuation slopes (dB/cm/MHz) drawn per lesion at cache build.
+# The VICTRE-derived phantoms assign tumors ~2.7 dB/cm/MHz^y (Li et al. 2021,
+# Park et al. 2025), about 3x published carcinoma values, which blackens the
+# whole shadow at 10+ MHz. Ranges from in-vitro/in-vivo breast compilations
+# (e.g. https://pmc.ncbi.nlm.nih.gov/articles/PMC1761921, table 5): carcinoma
+# ~0.6-1.2, fibroadenoma lower, simple cysts ~water.
+LESION_ATTENUATION_DB_CM_MHZ = {
+    TUMOR: (0.6, 1.2), NECROSIS: (0.4, 0.9), ANGIOGENESIS: (0.5, 1.0),
+    FIBROADENOMA: (0.3, 0.8), CYST: (0.0, 0.02),
+}
+NP_PER_M_PER_DB_PER_CM = 100 / 8.686
+
 # Overlay colors (RGB) for label views.
 COLORS = {
     BACKGROUND: (0, 0, 0), FAT: (230, 200, 120), SKIN: (240, 150, 150), EPIDERMIS: (250, 120, 120),

@@ -19,7 +19,7 @@ import numpy as np
 
 from breastsim import phantom, tissue
 from breastsim.probe import PROBES, ProbePose
-from breastsim.realtime.renderer import ImagingParams, PreviewRenderer
+from breastsim.realtime.renderer import ImagingParams, PreviewRenderer, spectral_attenuation_lut
 
 VOX = 0.2
 
@@ -123,8 +123,12 @@ def main():
     zz = (np.arange(len(prof)) + 0.5) * pz
     sel = (zz > 5) & (zz < 35)
     slope = np.polyfit(zz[sel], prof[sel], 1)[0] * 1e3              # dB/m
-    expect = -2 * alpha_np * spec.fc / 1e6 * 8.686
-    rep["attenuation"] = {"measured_db_per_cm": round(slope / 100, 2), "expected_db_per_cm": round(expect / 100, 2)}
+    A, E, fbar, _ = spectral_attenuation_lut(spec, 1.0)
+    a_path = alpha_np * zz[sel] * 1e-3                               # one-way Np/MHz along the fit window
+    expect = np.polyfit(zz[sel], 10 * np.log10(np.interp(a_path, A, E)), 1)[0] * 1e3
+    rep["attenuation"] = {"measured_db_per_cm": round(slope / 100, 2),
+                          "expected_spectral_db_per_cm": round(expect / 100, 2),
+                          "centre_frequency_only_db_per_cm": round(-2 * alpha_np * spec.fc / 1e6 * 8.686 / 100, 2)}
 
     # 4. anechoic cyst (r = 4 mm) 20 mm deep in attenuating gland: contrast and posterior enhancement
     env_c, meta_c, labels = preview(block_volume(alpha=alpha_np, cyst_radius=4), depth=40)
@@ -136,9 +140,11 @@ def main():
     below = db[rows.max() + 30:rows.max() + 100, cols.min() + 10:cols.max() - 10].mean()
     below_side = db[rows.max() + 30:rows.max() + 100, :max(1, cols.min() - 40)].mean()
     path = 2 * 4.0 * 1e-3 * 0.85                                     # ~mean chord through the cyst, m
-    rep["cyst"] = {"contrast_db": round(inside - side, 1),
-                   "posterior_enhancement_db": round(below - below_side, 1),
-                   "expected_enhancement_db_approx": round(2 * alpha_np * spec.fc / 1e6 * path * 8.686, 1)}
+    a_below = alpha_np * (20 + 4 + 5) * 1e-3                         # path to ~5 mm below the cyst
+    gain = 10 * np.log10(np.interp(a_below - alpha_np * path, A, E) / np.interp(a_below, A, E))
+    rep["cyst"] = {"contrast_db": round(float(inside - side), 1),
+                   "posterior_enhancement_db": round(float(below - below_side), 1),
+                   "expected_enhancement_db_spectral": round(float(gain), 1)}
 
     (out / "report.json").write_text(json.dumps(rep, indent=1, default=float))
     print(json.dumps(rep, indent=1, default=float))
