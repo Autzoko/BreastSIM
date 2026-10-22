@@ -5,6 +5,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DATA = Path(os.environ.get("BREASTSIM_DATA", ROOT / "data"))
 LIB = ROOT / "lib"
+OUTPUTS = ROOT / "outputs"
+# Derived caches live next to the big resources (data-001 on lab127).
+CACHE = Path(os.environ.get("BREASTSIM_BIG", DATA)) / "cache"
 
 # Resource directories under DATA (large ones are symlinks into BREASTSIM_BIG).
 NBP3D = DATA / "nbp3d_usct"            # Dataverse KBYQQ7: 4 USCT phantoms (A-D)
