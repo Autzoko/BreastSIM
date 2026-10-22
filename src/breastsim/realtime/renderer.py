@@ -244,6 +244,7 @@ class PreviewRenderer:
         out_w = max(2, int(round(width / p.px_x_mm)))
         mode = "area" if out_h <= nz and out_w <= nx else "bilinear"
         env2 = F.interpolate(env2[None, None], size=(out_h, out_w), mode=mode)[0, 0]
+        self.last_intensity = env2       # linear echo intensity before compression (validation)
         ref = float((kz ** 2).sum() * (_gauss_kernel(float(sig_x.median()), dev) ** 2).sum())
         db = 10 * torch.log10(env2 / ref + 1e-12)
         if p.speckle_reduction > 0:
