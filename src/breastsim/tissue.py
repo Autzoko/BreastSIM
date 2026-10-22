@@ -38,9 +38,9 @@ LESIONS = (CYST, FIBROADENOMA, ANGIOGENESIS, TUMOR, NECROSIS)
 # Breast US appearance: fat hypoechoic, glandular / ligaments / skin
 # hyperechoic, solid masses hypoechoic, cysts and vessels anechoic.
 ECHOGENICITY = {
-    BACKGROUND: 0.0, FAT: 0.45, SKIN: 1.1, EPIDERMIS: 1.3, GLAND: 1.0, NIPPLE: 0.6,
-    LIGAMENT: 1.4, TDLU: 0.8, DUCT: 0.15, ARTERY: 0.05, CYST: 0.03, FIBROADENOMA: 0.55,
-    ANGIOGENESIS: 0.5, TUMOR: 0.3, NECROSIS: 0.15, VEIN: 0.05,
+    BACKGROUND: 0.0, FAT: 0.35, SKIN: 1.1, EPIDERMIS: 1.3, GLAND: 1.0, NIPPLE: 0.5,
+    LIGAMENT: 1.4, TDLU: 0.7, DUCT: 0.1, ARTERY: 0.03, CYST: 0.02, FIBROADENOMA: 0.25,
+    ANGIOGENESIS: 0.4, TUMOR: 0.1, NECROSIS: 0.05, VEIN: 0.03,
 }
 
 # Acoustic properties for sources that only provide labels (OA-Breast):

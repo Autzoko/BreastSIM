@@ -29,7 +29,7 @@ NP_PER_DB = 1 / 8.686
 class ImagingParams:
     probe: str = "L11-5v"
     depth_mm: float = 40.0
-    gain_db: float = -8.0
+    gain_db: float = -12.0
     dynamic_range_db: float = 55.0
     tgc_db_cm_mhz: float = 0.5        # depth gain compensation
     specular: float = 12.0            # weight of impedance-boundary echoes
