@@ -111,7 +111,8 @@ def _stride(a, k):
 
 
 # Thin or small structures that must survive downsampling (later wins).
-PRIORITY_LABELS = (tissue.LIGAMENT, tissue.SKIN, tissue.EPIDERMIS, tissue.DUCT) + tissue.LESIONS
+PRIORITY_LABELS = (tissue.LIGAMENT, tissue.SKIN, tissue.EPIDERMIS, tissue.TDLU, tissue.DUCT,
+                   tissue.ARTERY, tissue.VEIN) + tissue.LESIONS
 
 
 def _downsample_labels(a, k):
@@ -342,7 +343,7 @@ def build_cache(pid, log=print):
             "mean_alpha": {int(l): float(alpha[label == l].mean()) for l in labels},
             "mean_c": {int(l): float(c[label == l].mean()) for l in labels},
             "lesions": lesions, "meshes": {k: [len(v[0]), len(v[1])] for k, v in meshes.items()},
-            "angiogenesis": "ignored",
+            "angiogenesis": "ignored", "vessels": "kept",
             "built": time.strftime("%Y-%m-%d %H:%M:%S"), "build_seconds": round(time.time() - t0, 1)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     log(f"[phantom] {pid}: shape {label.shape} @ {voxel} mm, {len(lesions)} lesion(s), "
@@ -356,7 +357,8 @@ def is_cached(pid):
         return False
     m = json.loads(f.read_text())
     # oat64 caches built while label_pa was merged into the labels must be rebuilt
-    return m.get("version") == CACHE_VERSION and (m.get("source") != "oat64" or m.get("angiogenesis") == "ignored")
+    # oat64 caches built while label_pa was merged, or before vessels were kept, must be rebuilt
+    return m.get("version") == CACHE_VERSION and (m.get("source") != "oat64" or m.get("vessels") == "kept")
 
 
 @contextlib.contextmanager
