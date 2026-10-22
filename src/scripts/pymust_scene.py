@@ -14,6 +14,10 @@ import argparse
 import os
 import time
 
+# one BLAS thread per PyMUST worker process (avoids oversubscription on many-core hosts)
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np
 import torch
 
@@ -74,12 +78,14 @@ def run_pymust(x, y, z, rc, depth, width, angles, workers):
     opt.setParPool(workers, "process")
     xi, zi = np.meshgrid(np.arange(-width / 2, width / 2, 0.1) * 1e-3, np.arange(0.5, depth, 0.05) * 1e-3)
     iq_sum = 0
-    for a in np.deg2rad(angles):
+    for k, a in enumerate(np.deg2rad(angles)):
+        t0 = time.time()
         tx = pymust.txdelay(param, a)
         rf, _ = pymust.simus(x[None], y[None], z[None], rc[None], tx, param, opt)
         iq = pymust.rf2iq(rf, param)
         m = pymust.dasmtx(1j * np.ones(iq.shape), xi, zi, tx, param)
         iq_sum = iq_sum + (m @ iq.flatten(order="F")).reshape(xi.shape, order="F")
+        print(f"  angle {k + 1}/{len(angles)}: {time.time() - t0:.0f} s", flush=True)
     tgc = np.exp(2 * 0.5 * 100 / 8.686 * param.fc / 1e6 * zi[:, :1])     # same 0.5 dB/cm/MHz TGC as the preview
     return np.abs(iq_sum) * tgc, xi, zi
 
@@ -91,10 +97,10 @@ def main():
     ap.add_argument("--du", type=float, default=0.0, help="probe offset from the lesion along u, mm")
     ap.add_argument("--rotation", type=float, default=0.0)
     ap.add_argument("--depth", type=float, default=35.0)
-    ap.add_argument("--slab", type=float, default=0.5, help="half elevation slab of scatterers, mm")
-    ap.add_argument("--keep", type=float, default=0.25, help="fraction of lattice scatterers simulated")
+    ap.add_argument("--slab", type=float, default=0.4, help="half elevation slab of scatterers, mm")
+    ap.add_argument("--keep", type=float, default=0.15, help="fraction of lattice scatterers simulated")
     ap.add_argument("--angles", type=int, default=3)
-    ap.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1))
+    ap.add_argument("--workers", type=int, default=min(32, os.cpu_count() or 1))
     ap.add_argument("--out", default="outputs/pymust_scene.png")
     args = ap.parse_args()
 
@@ -108,6 +114,7 @@ def main():
     t0 = time.time()
     x, y, z, rc, lab = scene_scatterers(vol, pose, spec, args.depth, args.slab, args.keep)
     t1 = time.time()
+    print(f"{len(x)} scatterers in {t1 - t0:.0f} s; running PyMUST ({args.workers} workers)", flush=True)
     env, xi, zi = run_pymust(x, y, z, rc, args.depth, width, np.linspace(-6, 6, args.angles), args.workers)
     t2 = time.time()
     print(f"{len(x)} scatterers ({t1 - t0:.0f} s), PyMUST {args.angles} angles {t2 - t1:.0f} s")
