@@ -149,10 +149,9 @@ def _load_oat64(info):
     with h5py.File(info.files["label"], "r") as h:
         voxel = float(np.array(h["voxel_size"]).ravel()[0])
         k = _factor(voxel)
+        # label_pa (peripheral angiogenesis) is an optical/functional map spanning ~50x the
+        # tumour volume, mostly fat; it has no sonographic counterpart, so it is not merged
         label = _downsample_labels(h["label"][()], k)
-        if "label_pa" in h:
-            pa = _stride(h["label_pa"][()], k) > 0
-            label[pa & ~np.isin(label, (tissue.TUMOR, tissue.NECROSIS))] = tissue.ANGIOGENESIS
     with h5py.File(info.files["acou"], "r") as h:
         c = _block_mean(h["sound_speed"][()], k) * 1e3                    # mm/us -> m/s
         z = c * _block_mean(h["density"][()], k) * 1e6 / 1e6              # g/mm^3 -> kg/m^3, -> MRayl
@@ -342,6 +341,7 @@ def build_cache(pid, log=print):
             "mean_alpha": {int(l): float(alpha[label == l].mean()) for l in labels},
             "mean_c": {int(l): float(c[label == l].mean()) for l in labels},
             "lesions": lesions, "meshes": {k: [len(v[0]), len(v[1])] for k, v in meshes.items()},
+            "angiogenesis": "ignored",
             "built": time.strftime("%Y-%m-%d %H:%M:%S"), "build_seconds": round(time.time() - t0, 1)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     log(f"[phantom] {pid}: shape {label.shape} @ {voxel} mm, {len(lesions)} lesion(s), "
@@ -351,7 +351,11 @@ def build_cache(pid, log=print):
 
 def is_cached(pid):
     f = cache_dir(pid) / "meta.json"
-    return f.exists() and json.loads(f.read_text()).get("version") == CACHE_VERSION
+    if not f.exists():
+        return False
+    m = json.loads(f.read_text())
+    # oat64 caches built while label_pa was merged into the labels must be rebuilt
+    return m.get("version") == CACHE_VERSION and (m.get("source") != "oat64" or m.get("angiogenesis") == "ignored")
 
 
 @contextlib.contextmanager

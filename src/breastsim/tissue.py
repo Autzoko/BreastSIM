@@ -31,8 +31,13 @@ NAMES = {
     VEIN: "vein",
 }
 
-# Labels that make up the segmentation / detection target.
-LESIONS = (CYST, FIBROADENOMA, ANGIOGENESIS, TUMOR, NECROSIS)
+# Labels that make up the segmentation / detection target. Peripheral
+# angiogenesis (IDB-8164905 label_pa) is an optical/functional property of the
+# tissue around a tumour, not a sonographic mass, so it is not a lesion label.
+LESIONS = (CYST, FIBROADENOMA, TUMOR, NECROSIS)
+
+# Sheet- or tube-like structures thinner than the ultrasound beam.
+THIN_STRUCTURES = (SKIN, EPIDERMIS, LIGAMENT, DUCT, ARTERY, VEIN)
 
 # Relative backscatter amplitude (std of sub-resolution scatterers).
 # Breast US appearance: fat hypoechoic, glandular / ligaments / skin

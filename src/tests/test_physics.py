@@ -181,3 +181,25 @@ def test_lesion_alpha_override():
     a = lesion_alpha(vol)
     assert np.allclose(a[ids == 1], 2.0 * tissue.NP_PER_M_PER_DB_PER_CM, rtol=1e-3)
     assert np.allclose(a[ids == 0], vol.alpha[ids == 0].astype(np.float32))
+
+
+def test_thin_ligament_parallel_to_beam_casts_only_a_faint_streak():
+    # a 0.4 mm ligament sheet along the beam (grazing incidence on both faces) in fat
+    shape = tuple(int(s / VOX) for s in (40, 60, 60))
+    label = np.full(shape, tissue.FAT, np.uint8)
+    mid = shape[1] // 2
+    label[: shape[0] - int(5 / VOX), mid - 1:mid + 1, :] = tissue.LIGAMENT
+    z = np.where(label == tissue.LIGAMENT, 1.68, 1.35).astype(np.float16)
+    c = np.where(label == tissue.LIGAMENT, 1480.0, 1440.0).astype(np.float16)
+    al = np.full(shape, 0.4 * tissue.NP_PER_M_PER_DB_PER_CM, np.float16)
+    vol = phantom.Volume("test/ligament", label, z, al, VOX, 1.0, np.full(shape[1:], 40.0, np.float32),
+                         np.zeros(shape[1:], bool), {}, c)
+    r, _, meta, _ = render(vol)
+    inten = r.last_intensity.cpu().numpy()
+    rows = slice(int(15 / meta["px_z_mm"]), int(30 / meta["px_z_mm"]))
+    prof = 10 * np.log10(inten[rows].mean(0))
+    centre = prof.shape[0] // 2
+    px = meta["px_x_mm"]
+    streak = prof[centre - int(0.5 / px):centre + int(0.5 / px)].mean()
+    beside = np.r_[prof[: centre - int(5 / px)], prof[centre + int(5 / px):]].mean()
+    assert beside - streak < 3.5

@@ -50,7 +50,7 @@ class ImagingParams:
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
     conform: bool = True              # probe presses the skin flat
     shadow_blur_mm: float = 0.0       # extra lateral fill-in of shadows (beam averaging is always applied)
-    edge_shadow_db: float = 20.0      # max two-way loss per boundary crossing (refraction / critical angle); 0 = off
+    edge_shadow_db: float = 12.0      # max two-way loss per bulk boundary crossing (refraction / critical angle); 0 = off
     overlay: str = "contour"          # none | contour | labels
     elevation_samples: int = 5        # planes across the elevation beam (attenuation, boundaries)
     preset: str = DEFAULT_PRESET
@@ -162,6 +162,8 @@ class PreviewRenderer:
         self.color_lut = torch.tensor(tissue.color_lut(), device=self.device)
         self.lesion_lut = torch.zeros(256, dtype=torch.bool, device=self.device)
         self.lesion_lut[list(tissue.LESIONS)] = True
+        self.thin_lut = torch.zeros(256, dtype=torch.bool, device=self.device)
+        self.thin_lut[list(tissue.THIN_STRUCTURES)] = True
         self._att_luts = {}
 
     # ------------------------------------------------------------- volume
@@ -243,9 +245,10 @@ class PreviewRenderer:
         e_lat, e_ax, e_el = axes
         step = cell / np.sqrt(2)                       # dense enough to hit (nearly) every cell
         depth = nz * dz
-        ny_max = 2 * float(sigma_y(torch.linspace(0, depth, 64, device=dev)).max()) + cell
-        slab = 2 * ny_max * (width + 2 * cell)         # mm^2 per mm of depth
-        chunk = max(1.0, max_points * step ** 3 / slab)
+        # depth chunks sized by the local beam thickness (thin near the elevation focus)
+        zgrid = torch.linspace(0, depth, 256, device=dev)
+        half = (2 * sigma_y(zgrid) + cell).cpu().numpy()       # half slab thickness per depth
+        zg = zgrid.cpu().numpy()
         xs = torch.arange(-width / 2 - cell, width / 2 + cell, step, device=dev)
         x_cols = torch.linspace(-width / 2, width / 2, nx, device=dev)
         xs_off = torch.from_numpy(np.interp(xs.cpu().numpy(), x_cols.cpu().numpy(), offs.cpu().numpy())).to(dev, torch.float32)
@@ -253,9 +256,15 @@ class PreviewRenderer:
         im = torch.zeros((nz + 1) * nx, device=dev)
         z0 = 0.0
         while z0 < depth:
-            z1 = min(depth, z0 + chunk)
+            # grow the chunk until it holds ~max_points samples
+            z1, ny = z0, 0.0
+            while z1 < depth:
+                ny = max(ny, float(np.interp(min(depth, z1 + 0.5), zg, half)), float(np.interp(z1, zg, half)))
+                if (z1 + 0.5 - z0 + 2 * cell) * (width + 2 * cell) * 2 * ny / step ** 3 > max_points and z1 > z0:
+                    break
+                z1 = min(depth, z1 + 0.5)
             zs = torch.arange(max(-cell, z0 - cell), z1 + cell, step, device=dev)
-            ys = torch.arange(-ny_max, ny_max + step, step, device=dev)
+            ys = torch.arange(-ny, ny + step, step, device=dev)
             Z, X, Y = torch.meshgrid(zs, torch.arange(len(xs), device=dev, dtype=zs.dtype), ys, indexing="ij")
             keep = Y.abs() <= 2 * sigma_y(Z.clamp(min=0)) + cell
             Z, X, Y = Z[keep], X[keep].long(), Y[keep]
@@ -319,7 +328,11 @@ class PreviewRenderer:
         ws = torch.exp(-0.5 * ts ** 2)
         ws = ws / ws.sum()
         theta0, s_diff, h = 0.25 / p.lateral_f_number, 0.25, 0.2
-        t_min = 10 ** (-p.edge_shadow_db / 20) if p.edge_shadow_db > 0 else 1.0   # cap per crossing (two-way)
+        # per-crossing cap of the two-way loss (Np): bulk interfaces up to edge_shadow_db, thin sheets
+        # (ligaments, ducts, vessel walls, skin) much less - they are narrower than the beam, which
+        # mostly passes around them
+        cap_bulk = p.edge_shadow_db / 4.343
+        cap_thin = min(p.edge_shadow_db, 3.0) / 4.343
         for t, w in zip(ts, ws):
             pts = plane + (t * sig_y)[..., None] * e_el
             lab = self._sample(self._labels, pts, "nearest")[0].long()
@@ -348,7 +361,10 @@ class PreviewRenderer:
                 bend = (theta - torch.asin(sin2.clamp(max=1.0))).abs()
                 T = torch.where(total, torch.zeros_like(rr), (1 - rr) * torch.exp(-0.5 * (bend / theta0) ** 2))
                 if p.edge_shadow_db > 0:
-                    loss.index_put_((iz + 1, ix), -2 * torch.log(T.clamp(min=t_min)), accumulate=True)
+                    thin = self.thin_lut[l1] | self.thin_lut[l2]
+                    two_way = -2 * torch.log(T.clamp(min=1e-6))
+                    two_way = torch.where(thin, torch.clamp(0.3 * two_way, max=cap_thin), torch.clamp(two_way, max=cap_bulk))
+                    loss.index_put_((iz + 1, ix), two_way, accumulate=True)
                 # echo
                 r = (z2 - z1) / (z2 + z1)
                 factor = (1 - s_diff) * torch.exp(-0.5 * (theta / theta0) ** 2) + s_diff * cos1
