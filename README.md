@@ -36,4 +36,23 @@ Code is synced through this git repository; data and envs are prepared per host.
 bash src/scripts/setup_lib.sh      # clone lib/ dependencies
 bash src/scripts/setup_env.sh      # create/update the conda env for this host
 bash src/scripts/fetch_data.sh     # download resources (resumable; --list / --only)
+python -m breastsim.phantom        # list phantoms; `python -m breastsim.phantom <id>` builds a preview cache
 ```
+
+## Real-time preview from the Mac
+
+The server runs on NYUAIRLAB-127's GPU, bound to localhost; the Mac reaches
+it through an SSH tunnel:
+
+```bash
+bash src/scripts/realtime_remote.sh            # start server in tmux if needed, tunnel, open browser
+bash src/scripts/realtime_remote.sh --restart  # pull latest code and restart the server
+bash src/scripts/realtime_remote.sh --stop     # stop the remote server
+```
+
+In the browser: click the coronal overview to place the probe, wheel to
+rotate; keys W/S (elevation), A/D (lateral), Q/E (rotate), R/F (tilt),
+Z/X (rock), Shift for larger steps. "Save scene" writes the phantom, pose
+and imaging parameters to `outputs/scenes/` for the data-generation side.
+
+Headless check: `python src/scripts/render_preview.py usct/A --sweep 3`.
