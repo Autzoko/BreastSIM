@@ -15,9 +15,14 @@ curves away), plane-wave transmits at several angles, element signals recorded b
 delay-and-sum beamforming with c0 = 1540 m/s, coherent compounding, envelope, TGC, log.
 """
 import itertools
+import os
 import tempfile
 import time
 import zlib
+
+# Parallel k-Wave runs each use their own files; HDF5's advisory locking only makes concurrent
+# opens fail with EAGAIN. Must be set before the HDF5 library is loaded.
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import h5py
 import numpy as np
@@ -265,8 +270,16 @@ def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, 
             w = signal.windows.tukey(len(act), 0.5)
         e_idx = el_of_col[acols] - act[0]
         t_end = 2 * depth_mm * 1e-3 / 1400 + 2 * t_c + tau.max()
-        p, t = _kwave_run(maps["c"][:, sub], maps["rho"][:, sub], maps["alpha"][:, sub], maps["alpha_power"], dx,
-                          acols - lo, tau[e_idx], w[e_idx], spec, t_end, gpu=gpu)
+        for attempt in range(3):
+            try:
+                p, t = _kwave_run(maps["c"][:, sub], maps["rho"][:, sub], maps["alpha"][:, sub], maps["alpha_power"],
+                                  dx, acols - lo, tau[e_idx], w[e_idx], spec, t_end, gpu=gpu)
+                break
+            except (BlockingIOError, OSError) as err:
+                if attempt == 2:
+                    raise
+                log(f"    line {li}: {err!r}, retrying")
+                time.sleep(2)
         rf = np.zeros((len(act), len(t)), np.float32)
         np.add.at(rf, e_idx, p)
         rf /= np.maximum(np.bincount(e_idx, minlength=len(act)), 1)[:, None]
