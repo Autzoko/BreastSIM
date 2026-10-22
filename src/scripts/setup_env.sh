@@ -21,6 +21,11 @@ else
     "$CONDA_BIN" env create "${TARGET[@]}" -f environment.yml -y
 fi
 
+if [[ "$BREASTSIM_HOST" == lab127 ]]; then
+    # /etc/pip.conf adds pypi.ngc.nvidia.com, which does not resolve on 127.
+    printf '[global]\nextra-index-url =\ntrusted-host =\n' > "$BREASTSIM_ENV/pip.conf"
+fi
+
 PIP=("${BREASTSIM_PY[@]}" -m pip)
 [[ -d lib/PyMUST ]] || bash src/scripts/setup_lib.sh
 "${PIP[@]}" install -e lib/PyMUST
