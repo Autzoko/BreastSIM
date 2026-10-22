@@ -49,12 +49,14 @@ class ProbeSpec:
 PROBES = {
     "L11-5v": ProbeSpec("L11-5v", 7.6e6, 0.77, 128, 0.3e-3, 5e-3, 18e-3),
     "L12-3v": ProbeSpec("L12-3v", 7.54e6, 0.93, 192, 0.2e-3, 5e-3, 20e-3),
+    # Clinical high-frequency linears have ~0.1 mm pitch (about one wavelength at 10-15 MHz),
+    # which keeps grating lobes out of the full-wave / beamformed images.
     # GE ML6-15-D matrix linear (BUSI, LOGIQ E9): 50 mm footprint, 1.5D thin slice
-    "ML6-15": ProbeSpec("ML6-15", 10e6, 0.8, 256, 0.2e-3, 4e-3, 15e-3),
+    "ML6-15": ProbeSpec("ML6-15", 10e6, 0.8, 512, 0.1e-3, 4e-3, 15e-3),
     # GE 10-14 MHz linear on LOGIQ 5/7 (BUS-BRA), generic 12 MHz linear (BrEaST)
-    "L12-hf": ProbeSpec("L12-hf", 11e6, 0.75, 192, 0.2e-3, 4e-3, 18e-3),
+    "L12-hf": ProbeSpec("L12-hf", 11e6, 0.75, 384, 0.1e-3, 4e-3, 18e-3),
     # ABUS 15.4 cm wide transducer, 6-15 MHz (TDSC-ABUS / Invenia ABUS class)
-    "ABUS-15": ProbeSpec("ABUS-15", 10e6, 0.9, 768, 0.2e-3, 8e-3, 22e-3),
+    "ABUS-15": ProbeSpec("ABUS-15", 10e6, 0.9, 1536, 0.1e-3, 8e-3, 22e-3),
 }
 
 
@@ -66,6 +68,10 @@ class ProbePose:
     tilt: float = 0.0      # deg, fan the beam toward elevation (about the array axis)
     rock: float = 0.0      # deg, rock the beam toward the array direction (about elevation)
     standoff: float = 0.0  # mm, gel between skin and probe face
+    # explicit placement (e.g. probe held normal to the skin on the side of the breast):
+    # face centre (a, u, v) mm and rows (lateral, axial, elevation); overrides the angles above
+    origin_mm: tuple = None
+    axes_rows: tuple = None
 
     def to_dict(self):
         return asdict(self)
@@ -94,6 +100,8 @@ class ProbePose:
 
     def frame(self, surface, voxel_mm, spec):
         """(origin, axes): origin is the face center (a, u, v) in mm."""
+        if self.origin_mm is not None:
+            return np.asarray(self.origin_mm, np.float64), np.asarray(self.axes_rows, np.float64)
         a0 = self.face_height(surface, voxel_mm, spec)
         return np.array([a0, self.u, self.v]), self.axes()
 

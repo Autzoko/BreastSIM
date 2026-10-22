@@ -14,49 +14,67 @@ from PIL import Image, ImageDraw
 
 from breastsim import phantom, tissue
 from breastsim.datagen.kwave_sim import render_pose
-from breastsim.probe import PROBES, ProbePose, _lookup
+from breastsim.probe import PROBES, ProbePose
 from breastsim.realtime.renderer import ImagingParams, PreviewRenderer
 
 
-def flattest_rotation(vol, u, v, spec):
-    """Rotation whose footprint has the smallest skin-height spread (least gel under the probe)."""
+def skin_normal_pose(vol, target, spec, rots=12):
+    """Probe on the skin point nearest to `target` (a, u, v) mm, beam pointing at the target,
+    rotated about the beam so the skin under the array is as flat as possible."""
+    skin = np.argwhere(np.isin(vol.label, (tissue.SKIN, tissue.EPIDERMIS)))
+    pts = skin * vol.voxel_mm
+    s = pts[np.argmin(((pts - target) ** 2).sum(1))]
+    d = (target - s) / np.linalg.norm(target - s)
+    ref = np.array([0.0, 1.0, 0.0]) if abs(d[1]) < 0.9 else np.array([0.0, 0.0, 1.0])
+    e1 = np.cross(d, ref); e1 /= np.linalg.norm(e1)
+    e2 = np.cross(d, e1)
+    origin = s - 0.5 * d                                      # face just outside the skin
     best = None
-    for rot in (0, 30, 60, 90, 120, 150):
-        pose = ProbePose(u=u, v=v, rotation=rot)
-        lat = pose.axes()[0]
-        s = np.linspace(-1, 1, 41) * spec.aperture * 1e3 / 2
-        h = _lookup(vol.surface, u + s * lat[1], v + s * lat[2], vol.voxel_mm)
-        if not np.isfinite(h).all():
-            continue
-        spread = float(h.max() - h.min())
-        if best is None or spread < best[0]:
-            best = (spread, rot)
-    return best
+    half = spec.aperture * 1e3 / 2
+    for th in np.linspace(0, np.pi, rots, endpoint=False):
+        lat = np.cos(th) * e1 + np.sin(th) * e2
+        el = np.cross(lat, d)
+        # distance from the face plane to the skin under the array (gel gap)
+        xs = np.linspace(-half, half, 25)
+        gaps = []
+        for x in xs:
+            p = origin + x * lat
+            dist = np.linalg.norm(pts - p, axis=1)
+            near = pts[dist < 3]
+            gaps.append(0.0 if len(near) == 0 else float(((near - p) @ d).min()))
+        g = max(gaps)
+        if best is None or g < best[0]:
+            best = (g, lat, el)
+    g, lat, el = best
+    pose = ProbePose(u=float(s[1]), v=float(s[2]), origin_mm=tuple(origin), axes_rows=(tuple(lat), tuple(d), tuple(el)))
+    return pose, g, float(np.linalg.norm(target - s))
 
 
 def choose_poses(n, rng):
     ids = [p.id for p in phantom.list_phantoms() if p.id.startswith("oat64/") and p.id.endswith("l")
            and phantom.is_cached(p.id)]
-    poses = []
     spec = PROBES["L12-hf"]
+    poses = []
+    n_les = n - n // 3
     for pid in ids:
+        if len(poses) >= n_les:
+            break
         vol = phantom.load(pid, chest_wall=False)
-        for les in vol.meta.get("lesions", []):
-            a, u, v = les["center_mm"]
-            fr = flattest_rotation(vol, u, v, spec)
-            if fr is None:
+        for les in vol.meta.get("lesions", [])[:2]:
+            pose, gap, depth = skin_normal_pose(vol, np.array(les["center_mm"]), spec)
+            if depth > 40:
                 continue
-            depth = float(np.nanmax(vol.surface) - a)
-            poses.append(dict(pid=pid, u=u, v=v, rot=fr[1], gap=fr[0], kind=f"lesion #{les['id']} {les['type']}",
-                              depth=float(np.clip(depth + 10, 30, 45))))
-    poses = sorted(poses, key=lambda p: p["gap"])[: max(1, n - n // 3)]
-    # normal-tissue views near the dome of a few phantoms
-    for pid in ids[: n - len(poses)]:
+            poses.append(dict(pid=pid, pose=pose, gap=gap, kind=f"lesion #{les['id']} {les['type']}",
+                              depth=float(np.clip(depth + 12, 25, 45))))
+    for pid in ids:
+        if len(poses) >= n:
+            break
         vol = phantom.load(pid, chest_wall=False)
-        iu, iv = np.unravel_index(np.nanargmax(vol.surface), vol.surface.shape)
-        u, v = iu * vol.voxel_mm + rng.uniform(-8, 8), iv * vol.voxel_mm + rng.uniform(-8, 8)
-        fr = flattest_rotation(vol, u, v, spec) or (0, 0)
-        poses.append(dict(pid=pid, u=u, v=v, rot=fr[1], gap=fr[0], kind="normal tissue", depth=35.0))
+        tissue_vox = np.argwhere(np.isin(vol.label, (tissue.GLAND,)))
+        target = tissue_vox[rng.integers(len(tissue_vox))] * vol.voxel_mm
+        pose, gap, depth = skin_normal_pose(vol, target, spec)
+        poses.append(dict(pid=pid, pose=pose, gap=gap, kind="glandular / normal tissue",
+                          depth=float(np.clip(depth + 12, 25, 40))))
     return poses[:n]
 
 
@@ -69,7 +87,7 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     poses = choose_poses(args.n, np.random.default_rng(0))
-    print(json.dumps(poses, indent=1), flush=True)
+    print(json.dumps([{k: v for k, v in p.items() if k != "pose"} for p in poses], indent=1), flush=True)
     r = PreviewRenderer()
     rows, report = [], []
     for k, ps in enumerate(poses):
@@ -77,7 +95,7 @@ def main():
         vol = phantom.load(ps["pid"], chest_wall=False)
         for les in vol.meta.get("lesions", []):               # phantom's own lesion attenuation
             les.pop("attenuation_db_cm_mhz", None)
-        pose = ProbePose(u=ps["u"], v=ps["v"], rotation=ps["rot"])
+        pose = ps["pose"]
         print(f"[{k + 1}/{len(poses)}] {ps['pid']} {ps['kind']} depth {ps['depth']:.0f} mm", flush=True)
         kw, lab, info = render_pose(ps["pid"], vol, pose, depth_mm=ps["depth"], scatter_strength=args.strength)
         r.set_volume(vol)
@@ -91,7 +109,8 @@ def main():
         ImageDraw.Draw(im).text((6, 6), f"{k + 1}. {ps['pid']}  {ps['kind']}  k-Wave | preview | labels", fill=(255, 255, 0))
         im.save(out / f"{k + 1:02d}.png")
         Image.fromarray(kw).save(out / f"{k + 1:02d}_kwave.png")
-        info.update(ps, total_s=round(time.time() - t0, 1))
+        info.update({k: v for k, v in ps.items() if k != "pose"}, total_s=round(time.time() - t0, 1),
+                    origin_mm=list(pose.origin_mm), axes=[list(r) for r in pose.axes_rows])
         report.append(info)
         print(f"   done in {info['total_s']} s", flush=True)
         (out / "report.json").write_text(json.dumps(report, indent=1))

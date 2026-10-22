@@ -179,6 +179,7 @@ def simulate(maps, spec, angles_deg=(-8, -4, 0, 4, 8), cfl=0.3, gpu=True, log=pr
         el = np.zeros((n_el, len(t)), np.float32)                   # average the points of each element
         np.add.at(el, el_of_col[cols], p)
         el /= np.maximum(np.bincount(el_of_col[cols], minlength=n_el), 1)[:, None]
+        el[:, t < 2 * t_c + max_delay] = 0.0          # transmit pulse picked up by the receiving elements
         rf.append(el)
         log(f"    angle {ang:+.0f}: {nz}x{nx} grid, Nt={len(t)}, {time.time() - t0:.1f} s")
     return np.stack(rf), float(kgrid.dt), x_el, t_c
@@ -217,7 +218,7 @@ def to_bmode(env, depth_mm, fc_mhz, tgc_db_cm_mhz=0.5, dr_db=55.0):
     return (np.clip(db / dr_db + 1, 0, 1) * 255).astype(np.uint8)
 
 
-def render_pose(pid, vol, pose, probe="L12-hf", depth_mm=40.0, dx_mm=0.032, angles_deg=(-8, -4, 0, 4, 8),
+def render_pose(pid, vol, pose, probe="L12-hf", depth_mm=40.0, dx_mm=0.024, angles_deg=(-8, -4, 0, 4, 8),
                 scatter_strength=0.02, log=print):
     spec = PROBES[probe]
     t0 = time.time()
