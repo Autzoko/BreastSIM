@@ -98,3 +98,17 @@ def test_meshes_cover_the_lesion(synthetic_volume):
     assert r.mean() == pytest.approx(3.0, abs=0.4)
     sv, sf = meshes["skin"]
     assert len(sf) > 100 and sv[:, 0].max() == pytest.approx(np.nanmax(vol.surface), abs=1.2)
+
+
+def test_display_meshes_are_smooth_and_cached(synthetic_volume, monkeypatch, tmp_path):
+    monkeypatch.setattr(phantom.paths, "CACHE", tmp_path)
+    vol = synthetic_volume
+    vol.lesion_id = np.isin(vol.label, tissue.LESIONS).astype(np.uint8)
+    m = phantom.display_meshes(vol)
+    assert {"skin", "gland", "lesion0"} <= set(m)
+    v, f = m["skin"]
+    assert f.max() < len(v) and v[:, 0].max() == pytest.approx(np.nanmax(vol.surface), abs=1.0)
+    # Taubin smoothing keeps the dome: apex height within 1 mm, no shrinkage of the base
+    m2 = phantom.display_meshes(vol)                     # second call reads the cache file
+    assert np.array_equal(m2["skin"][0], v)
+    assert (tmp_path / "preview" / "synthetic__dome" / f"display_meshes_v{phantom.DISPLAY_MESH_VERSION}.npz").exists()

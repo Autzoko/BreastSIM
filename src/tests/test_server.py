@@ -17,6 +17,7 @@ def client(synthetic_volume, monkeypatch, tmp_path):
     meshes = phantom.build_meshes(synthetic_volume.label, synthetic_volume.voxel_mm, synthetic_volume.meta["lesions"])
     monkeypatch.setattr(server.phantom, "load", lambda pid, log=print: synthetic_volume)
     monkeypatch.setattr(server.phantom, "load_meshes", lambda pid: meshes)
+    monkeypatch.setattr(server.phantom, "display_meshes", lambda vol: meshes)
     monkeypatch.setattr(server.phantom, "is_cached", lambda pid: True)
     monkeypatch.setattr(server, "SCENES", tmp_path / "scenes")
     monkeypatch.setattr(server.paths, "ROOT", tmp_path)

@@ -444,6 +444,66 @@ def add_chest_wall(vol, depth_mm=25.0):
     return vol
 
 
+DISPLAY_MESH_VERSION = 2
+CHEST_WALL_LABELS = (tissue.MUSCLE, tissue.FASCIA, tissue.RIB, tissue.LUNG)
+
+
+def taubin_smooth(verts, faces, iters=10, lam=0.5, mu=-0.53):
+    """Taubin (lambda|mu) smoothing: removes voxel staircase without shrinking the surface."""
+    from scipy import sparse
+    n = len(verts)
+    if n == 0:
+        return verts
+    i = np.concatenate([faces[:, 0], faces[:, 1], faces[:, 2], faces[:, 1], faces[:, 2], faces[:, 0]])
+    j = np.concatenate([faces[:, 1], faces[:, 2], faces[:, 0], faces[:, 0], faces[:, 1], faces[:, 2]])
+    adj = sparse.coo_matrix((np.ones(len(i), np.float32), (i, j)), shape=(n, n)).tocsr()
+    adj.data[:] = 1.0
+    deg = np.asarray(adj.sum(1)).ravel()
+    w = sparse.diags(1.0 / np.maximum(deg, 1)) @ adj
+    v = verts.astype(np.float64)
+    for _ in range(iters):
+        v = v + lam * (w @ v - v)
+        v = v + mu * (w @ v - v)
+    return v.astype(np.float32)
+
+
+def _cropped_mesh(mask, voxel, factor, sigma, a0, smooth_iters):
+    """Mesh of a (possibly sparse) mask cropped to its bounding box; vertices (a, u, v) mm."""
+    nz = np.nonzero(mask)
+    if len(nz[0]) == 0:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint32)
+    lo = [max(0, int(x.min()) - 3) for x in nz]
+    hi = [int(x.max()) + 4 for x in nz]
+    sub = mask[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
+    v, f = _mesh(sub, voxel, factor=factor, sigma=sigma)
+    v = v + np.array(lo, np.float32) * voxel + np.array([a0, 0, 0], np.float32)
+    return (taubin_smooth(v, f, smooth_iters) if smooth_iters else v), f
+
+
+def display_meshes(vol):
+    """Smoothed surfaces for the 3D view (skin, glandular tissue, vessels, ducts, lesions),
+    cached per phantom in display_meshes_v{N}.npz. Vertices are (a, u, v) mm."""
+    f = cache_dir(vol.id) / f"display_meshes_v{DISPLAY_MESH_VERSION}.npz"
+    if f.exists():
+        with np.load(f) as z:
+            names = sorted({k.rsplit("_", 1)[0] for k in z.files})
+            return {n: (z[f"{n}_verts"], z[f"{n}_faces"]) for n in names}
+    lab, vox, a0 = vol.label, vol.voxel_mm, vol.a0_mm
+    breast = (lab > 0) & ~np.isin(lab, CHEST_WALL_LABELS)
+    out = {"skin": _cropped_mesh(breast, vox, 3, 1.2, a0, 10),
+           "gland": _cropped_mesh(np.isin(lab, (tissue.GLAND, tissue.TDLU)), vox, 2, 0.8, a0, 6)}
+    for name, labs in (("artery", (tissue.ARTERY,)), ("vein", (tissue.VEIN,)), ("duct", (tissue.DUCT,))):
+        m = np.isin(lab, labs)
+        if m.sum() > 50:
+            out[name] = _cropped_mesh(m, vox, 1, 0.5, a0, 4)
+    for les in vol.meta.get("lesions", []):
+        if vol.lesion_id is not None:
+            out[f"lesion{les['id']}"] = _cropped_mesh(vol.lesion_id == les["id"] + 1, vox, 1, 0.6, a0, 4)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(f, **{f"{k}_{p}": a for k, va in out.items() for p, a in zip(("verts", "faces"), va)})
+    return out
+
+
 def load_meshes(pid):
     """{name: (verts (N,3) a,u,v mm, faces (M,3))} from the cache."""
     with np.load(cache_dir(pid) / "meshes.npz") as z:

@@ -189,12 +189,13 @@ def overview():
 
 
 @app.get("/api/meshes")
-def meshes():
-    """Surfaces of the loaded phantom for the 3D view, in (a, u, v) mm."""
-    if renderer.vol is None:
+async def meshes():
+    """Surfaces of the loaded phantom for the 3D view, in (a, u, v) mm (built once, then cached)."""
+    vol = renderer.vol
+    if vol is None:
         return JSONResponse({"error": "no phantom loaded"}, 404)
     out = {}
-    for name, (verts, faces) in phantom.load_meshes(renderer.vol.id).items():
+    for name, (verts, faces) in (await asyncio.to_thread(phantom.display_meshes, vol)).items():
         out[name] = {"verts": _b64(verts.astype(np.float32)), "faces": _b64(faces.astype(np.uint32)),
                      "n_verts": int(len(verts)), "n_faces": int(len(faces))}
     return out

@@ -3,6 +3,8 @@
 // three.js frame: x = v, y = a, z = u.
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 const $ = (id) => document.getElementById(id);
 const S = {
@@ -109,24 +111,25 @@ function initScene() {
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setClearColor(0x080a0d);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  renderer.localClippingEnabled = true;
   host.appendChild(renderer.domElement);
   const scene = new THREE.Scene();
+  scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
   const camera = new THREE.PerspectiveCamera(38, 1, 1, 5000);
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.1));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 0.5));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.0);
   sun.position.set(200, 400, 300);
   scene.add(sun);
   const anatomy = new THREE.Group(), guides = new THREE.Group();
   scene.add(anatomy, guides);
 
-  // probe: local x = array (marker at -x), y = handle (against the beam), z = elevation
+  // probe: local x = array (orientation marker at -x), y = handle (against the beam), z = elevation;
+  // the model is rebuilt for each transducer footprint (makeProbe)
   const probe = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0xd8dde4, roughness: 0.5, transparent: true, opacity: 0.5, depthWrite: false }));
-  const face = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: 0x4cc38a, emissive: 0x1b5c3d }));
-  const marker = new THREE.Mesh(new THREE.SphereGeometry(1.6, 16, 12), new THREE.MeshStandardMaterial({ color: 0x4cc38a, emissive: 0x2a7a52 }));
-  probe.add(body, face, marker);
   probe.matrixAutoUpdate = false;
   scene.add(probe);
 
@@ -147,7 +150,8 @@ function initScene() {
   plane.renderOrder = 3;
   scene.add(plane);
 
-  Object.assign(three, { renderer, scene, camera, controls, anatomy, guides, probe, body, face, marker, plane, planeGeo, texCanvas, texture, meshes: {} });
+  const clip = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);   // cutaway at the scan plane
+  Object.assign(three, { renderer, scene, camera, controls, anatomy, guides, probe, plane, planeGeo, texCanvas, texture, clip, meshes: {}, probeKey: null });
   new ResizeObserver(resize).observe(host);
   resize();
   bindPicking();
@@ -177,7 +181,32 @@ function disposeGroup(g) {
   g.clear();
 }
 
+const MESH_STYLE = {
+  skin: () => new THREE.MeshPhysicalMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.55, sheen: 0.4,
+    sheenColor: 0xffc9b0, sheenRoughness: 0.5, transparent: true, depthWrite: false, side: THREE.DoubleSide }),
+  gland: () => new THREE.MeshPhysicalMaterial({ color: 0xf2efe6, roughness: 0.6, transparent: true, opacity: 0.55,
+    depthWrite: false, side: THREE.DoubleSide }),
+  artery: () => new THREE.MeshStandardMaterial({ color: 0xc8323a, roughness: 0.4 }),
+  vein: () => new THREE.MeshStandardMaterial({ color: 0x3a4fb8, roughness: 0.4 }),
+  duct: () => new THREE.MeshStandardMaterial({ color: 0xe8d38a, roughness: 0.5 }),
+  lesion: () => new THREE.MeshPhysicalMaterial({ color: 0xd9363e, roughness: 0.5, clearcoat: 0.3, emissive: 0x3a0808 }),
+};
+const SKIN_RGB = [0.91, 0.76, 0.65], AREOLA_RGB = [0.70, 0.47, 0.40], NIPPLE_RGB = [0.60, 0.37, 0.33];
+
+function skinColors(verts) {
+  // areola / nipple pigmentation around the nipple (coronal distance), anterior surface only
+  const [na, nu, nv] = S.info.nipple_mm, col = new Float32Array(verts.length);
+  for (let i = 0; i < verts.length; i += 3) {
+    const a = verts[i + 1], u = verts[i + 2], v = verts[i];          // three (x=v, y=a, z=u)
+    const d = Math.hypot(u - nu, v - nv), front = a > na - 18 ? 1 : 0;
+    const ar = front * (1 - THREE.MathUtils.smoothstep(d, 14, 18)), np = front * (1 - THREE.MathUtils.smoothstep(d, 4, 6));
+    for (let k = 0; k < 3; k++) col[i + k] = SKIN_RGB[k] * (1 - ar) + (AREOLA_RGB[k] * (1 - np) + NIPPLE_RGB[k] * np) * ar;
+  }
+  return col;
+}
+
 async function loadMeshes() {
+  status(`${S.info.id}: loading 3D surfaces…`);
   const data = await (await fetch("/api/meshes")).json();
   disposeGroup(three.anatomy);
   three.meshes = {};
@@ -189,30 +218,67 @@ async function loadMeshes() {
     geo.setAttribute("position", new THREE.BufferAttribute(verts, 3));
     geo.setIndex(new THREE.BufferAttribute(decode(m.faces, Uint32Array), 1));
     geo.computeVertexNormals();
-    let mat;
-    if (name === "skin") mat = new THREE.MeshStandardMaterial({ color: 0xe9c4a6, transparent: true, opacity: +$("skinOpacity").value, depthWrite: false, side: THREE.DoubleSide, roughness: 0.85 });
-    else if (name === "gland") mat = new THREE.MeshStandardMaterial({ color: 0x6fa8ff, transparent: true, opacity: 0.3, depthWrite: false, side: THREE.DoubleSide });
-    else mat = new THREE.MeshStandardMaterial({ color: 0xff4d4d, emissive: 0x551010, side: THREE.DoubleSide });
-    const mesh = new THREE.Mesh(geo, mat);
+    const kind = name.startsWith("lesion") ? "lesion" : name;
+    if (!MESH_STYLE[kind]) continue;
+    if (kind === "skin") geo.setAttribute("color", new THREE.BufferAttribute(skinColors(verts), 3));
+    const mesh = new THREE.Mesh(geo, MESH_STYLE[kind]());
     mesh.name = name;
-    mesh.renderOrder = name === "skin" ? 2 : name === "gland" ? 1 : 0;
+    mesh.renderOrder = kind === "skin" ? 3 : kind === "gland" ? 2 : 1;
     three.meshes[name] = mesh;
     three.anatomy.add(mesh);
   }
+  buildChestWall();
   S.meshCount = Object.keys(three.meshes).length;
   buildGuides();
   applyVisibility();
   recenter(true);
 }
 
+function buildChestWall() {
+  // pectoralis, ribs, pleura and the torso skin around the breast base (geometry from the server's
+  // procedural chest-wall parameters; coordinates (a, u, v) mm, chest-wall plane at a = 0)
+  const cw = S.info.chest_wall;
+  if (!cw) return;
+  const [, U, V] = S.info.extent_mm, ext = Math.max(U, V) * 1.6, cu = U / 2, cv = V / 2;
+  const add = (name, mesh) => { mesh.name = name; three.meshes[name] = mesh; three.anatomy.add(mesh); };
+  const muscle = new THREE.Mesh(new RoundedBoxGeometry(ext, cw.muscle_mean_mm, ext, 2, 2),
+    new THREE.MeshPhysicalMaterial({ color: 0xa3434d, roughness: 0.7, sheen: 0.3, sheenColor: 0xff8a8a }));
+  muscle.position.copy(T([-cw.muscle_mean_mm / 2, cu, cv]));
+  add("chest:muscle", muscle);
+  const ribMat = new THREE.MeshPhysicalMaterial({ color: 0xece4d0, roughness: 0.6, clearcoat: 0.2 });
+  const ribA = -(cw.muscle_mean_mm + cw.rib_center_below_muscle_mm);
+  cw.rib_u_mm.forEach((ru, i) => {
+    if (ru < cu - ext / 2 || ru > cu + ext / 2) return;
+    const rib = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, ext, 24), ribMat);
+    rib.rotation.z = Math.PI / 2;                                   // run along v (three x)
+    rib.scale.set(cw.rib_half_height_mm, 1, cw.rib_half_width_mm);  // elliptic cross-section (a x u)
+    rib.position.copy(T([ribA, ru, cv]));
+    add(`chest:rib${i}`, rib);
+  });
+  const pleura = new THREE.Mesh(new THREE.PlaneGeometry(ext, ext), new THREE.MeshStandardMaterial({ color: 0x5b6577, roughness: 0.3, side: THREE.DoubleSide }));
+  pleura.rotation.x = -Math.PI / 2;
+  pleura.position.copy(T([-(cw.muscle_mean_mm + cw.pleura_below_muscle_mm), cu, cv]));
+  add("chest:pleura", pleura);
+  // torso skin around the breast base: a thin rounded slab at the chest-wall plane with a hole-free
+  // look (the breast skin mesh covers the centre)
+  const torso = new THREE.Mesh(new RoundedBoxGeometry(ext, 2, ext, 2, 1), MESH_STYLE.skin());
+  const tc = new Float32Array(torso.geometry.attributes.position.count * 3);
+  for (let i = 0; i < tc.length; i += 3) tc.set(SKIN_RGB, i);
+  torso.geometry.setAttribute("color", new THREE.BufferAttribute(tc, 3));
+  torso.position.copy(T([0.5, cu, cv]));
+  torso.renderOrder = 3;
+  add("torso", torso);
+}
+
 function buildGuides() {
   disposeGroup(three.guides);
   const [A, U, V] = S.info.extent_mm, g = three.guides, n = S.info.nipple_mm;
-  // chest wall reference plane (a = 0)
-  const grid = new THREE.GridHelper(Math.max(U, V), Math.round(Math.max(U, V) / 10), 0x3a4452, 0x222a33);
-  grid.position.copy(T([0, U / 2, V / 2]));
-  g.add(grid);
-  const chest = textSprite("chest wall", "#8b95a3", 4); chest.position.copy(T([0, U + 4, V / 2])); g.add(chest);
+  // chest wall reference grid only when the phantom has no chest wall model
+  if (!S.info.chest_wall) {
+    const grid = new THREE.GridHelper(Math.max(U, V), Math.round(Math.max(U, V) / 10), 0x3a4452, 0x222a33);
+    grid.position.copy(T([0, U / 2, V / 2]));
+    g.add(grid);
+  }
   // nipple marker
   const nip = new THREE.Mesh(new THREE.SphereGeometry(1.8, 16, 12), new THREE.MeshStandardMaterial({ color: 0xff9ec7, emissive: 0x552233 }));
   nip.position.copy(T(n)); g.add(nip);
@@ -232,23 +298,54 @@ function buildGuides() {
 }
 
 function applyVisibility() {
+  const show = { skin: $("showSkin").checked, torso: $("showSkin").checked, gland: $("showGland").checked,
+    artery: $("showVessels").checked, vein: $("showVessels").checked, duct: $("showVessels").checked };
+  const cut = $("cutaway").checked ? [three.clip] : [];
   for (const [name, m] of Object.entries(three.meshes)) {
-    m.visible = name === "skin" ? $("showSkin").checked : name === "gland" ? $("showGland").checked : $("showLesions").checked;
+    m.visible = name.startsWith("lesion") ? $("showLesions").checked
+      : name.startsWith("chest:") ? $("showChest").checked : !!show[name];
+    if (["skin", "torso", "gland"].includes(name) || name === "chest:muscle") {
+      m.material.clippingPlanes = cut;
+      m.material.needsUpdate = true;
+    }
   }
   three.plane.visible = $("showPlane").checked;
   three.guides.visible = $("showGuides").checked;
   three.guides.children.forEach((c) => { if (c.userData.lesion) c.visible = $("showLesions").checked; });
-  if (three.meshes.skin) three.meshes.skin.material.opacity = +$("skinOpacity").value;
+  const op = +$("skinOpacity").value;
+  ["skin", "torso"].forEach((k) => { if (three.meshes[k]) three.meshes[k].material.opacity = op; });
 }
 
 function recenter(full) {
   if (!S.info) return;
-  const [A, U, V] = S.info.extent_mm;
-  const target = full ? T([A * 0.45, U / 2, V / 2]) : T([S.lastMeta ? S.lastMeta.face_a_mm - 15 : A / 2, S.pose.u, S.pose.v]);
+  const [A, U, V] = S.info.extent_mm, [a0, a1] = S.info.a_range_mm || [0, A];
+  const target = full ? T([a0 + (a1 - a0) * 0.55, U / 2, V / 2]) : T([S.lastMeta ? S.lastMeta.face_a_mm - 15 : (a0 + a1) / 2, S.pose.u, S.pose.v]);
   const r = Math.max(A, U, V) * (full ? 1.7 : 0.9);
   three.controls.target.copy(target);
   three.camera.position.copy(target).add(new THREE.Vector3(r * 0.5, r * 0.8, r * 0.6));
   three.camera.near = r / 100; three.camera.far = r * 20; three.camera.updateProjectionMatrix();
+}
+
+// Linear-array transducer: silicone lens, scan head, tapered neck, handle, cable and the
+// orientation LED on the marker (-x) side. Dimensions in mm, face at y = 0.
+function makeProbe(W, H) {
+  const g = new THREE.Group();
+  const plastic = (color, rough = 0.45) => new THREE.MeshPhysicalMaterial({ color, roughness: rough, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.35 });
+  const part = (geo, mat, y, name) => { const m = new THREE.Mesh(geo, mat); m.position.y = y; m.name = name; g.add(m); return m; };
+  const headW = W + 6, headD = H + 10;
+  part(new RoundedBoxGeometry(W + 1, 1.6, H + 1.5, 3, 0.6), new THREE.MeshPhysicalMaterial({ color: 0x8a97a3, roughness: 0.75 }), 0.8, "lens");
+  part(new RoundedBoxGeometry(headW, 12, headD, 4, 2.5), plastic(0x2a3036), 1.6 + 6, "head");
+  const neckW = Math.min(headW, Math.max(18, W * 0.45));
+  part(new RoundedBoxGeometry(neckW, 14, Math.min(headD, 16), 4, 3.5), plastic(0x30373e), 13.6 + 7, "neck");
+  part(new RoundedBoxGeometry(26, 70, 19, 5, 7), plastic(0xdfe3e8, 0.4), 27.6 + 35, "handle");
+  const led = part(new RoundedBoxGeometry(2.2, 6, 4, 2, 0.8), new THREE.MeshStandardMaterial({ color: 0x4cc38a, emissive: 0x3fbf7f, emissiveIntensity: 1.5 }), 8, "marker");
+  led.position.x = -headW / 2 - 0.6;
+  const top = 27.6 + 70;
+  const curve = new THREE.CatmullRomCurve3([new THREE.Vector3(0, top, 0), new THREE.Vector3(0, top + 25, 0),
+    new THREE.Vector3(8, top + 60, 10), new THREE.Vector3(30, top + 90, 35)]);
+  part(new THREE.TubeGeometry(curve, 48, 3, 12, false), plastic(0x1d2126, 0.6), 0, "cable");
+  part(new THREE.CylinderGeometry(5, 4, 12, 20), plastic(0x1d2126, 0.6), top + 4, "strain-relief");
+  return g;
 }
 
 function updateProbe3D(meta, bitmap) {
@@ -256,10 +353,14 @@ function updateProbe3D(meta, bitmap) {
   const W = spec.aperture_mm, H = spec.height * 1e3;
   const X = T(lat), Y = T(ax).negate(), Z = T(el).negate();  // right-handed basis
   three.probe.matrix.copy(new THREE.Matrix4().makeBasis(X, Y, Z).setPosition(T(o)));
-  const handle = 12;
-  three.body.scale.set(W + 2, handle, H + 3); three.body.position.set(0, handle / 2 + 1.5, 0);
-  three.face.scale.set(W, 1.5, H); three.face.position.set(0, 0.75, 0);
-  three.marker.position.set(-W / 2 - 3, handle * 0.7, 0);  // orientation marker = image left
+  const key = `${S.params.probe}`;
+  if (three.probeKey !== key) {                                // rebuild the model for this footprint
+    disposeGroup(three.probe);
+    three.probe.add(makeProbe(W, H));
+    three.probeKey = key;
+  }
+  // cutaway: hide the anatomy on the +elevation side of the scan plane
+  three.clip.setFromNormalAndCoplanarPoint(T(el).normalize().negate(), T(o));
   const offs = meta.plane_offsets_mm, n = offs.length, pos = three.planeGeo.attributes.position.array;
   const vlat = new THREE.Vector3(...lat), vax = new THREE.Vector3(...ax), vo = new THREE.Vector3(...o);
   for (let i = 0; i < n; i++) {
@@ -541,7 +642,8 @@ window.addEventListener("keydown", (e) => {
 });
 
 // ================================================================ init
-["showSkin", "showGland", "showLesions", "showPlane", "showGuides", "skinOpacity"].forEach((id) => $(id).addEventListener("input", applyVisibility));
+["showSkin", "showGland", "showVessels", "showChest", "showLesions", "showPlane", "showGuides", "cutaway", "skinOpacity"]
+  .forEach((id) => $(id).addEventListener("input", applyVisibility));
 $("showGT").addEventListener("input", () => {
   $("gtView").hidden = !$("showGT").checked;
   document.querySelector(".views").classList.toggle("single", !$("showGT").checked);
