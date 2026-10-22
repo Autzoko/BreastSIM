@@ -12,6 +12,7 @@ Tests (homogeneous / simple numerical phantoms):
 """
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -82,6 +83,7 @@ def pymust_reference(region, density=40, angles=7):
     xi, zi = np.meshgrid(np.arange(x0, x1, 0.05) * 1e-3, np.arange(z0, z1, 0.025) * 1e-3)
     opt = pymust.utils.Options()
     opt.ParPool = True
+    opt.setParPool(min(16, os.cpu_count() or 1), "process")   # leave cores free on shared hosts
     iq_sum = 0
     for a in np.deg2rad(np.linspace(-6, 6, angles)):
         tx = pymust.txdelay(param, a)
