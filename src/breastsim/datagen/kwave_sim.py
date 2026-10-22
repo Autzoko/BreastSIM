@@ -20,7 +20,7 @@ import zlib
 
 import h5py
 import numpy as np
-from scipy import ndimage, signal
+from scipy import ndimage, signal, stats
 
 from .. import phantom, scatter, tissue
 from ..probe import PROBES
@@ -269,7 +269,7 @@ def beamform(rf, dt, x_el, t_c, angles_deg, depth_mm, width_mm, px_mm=0.1, f_num
     return (img.abs() / wsum.clamp(min=1e-6) * (wsum > 0)).cpu().numpy()
 
 
-def to_bmode(env, depth_mm, spec, alpha_power, tgc_db_cm_mhz=0.5, dr_db=55.0):
+def to_bmode(env, depth_mm, spec, alpha_power, tgc_db_cm_mhz=0.5, dr_db=55.0, auto_tgc=True):
     """Envelope -> 8-bit B-mode. TGC compensates a nominal tissue attenuation (dB/cm/MHz^y)
     for the whole pulse spectrum, not just fc: attenuation shifts the echo spectrum down, so
     the received energy falls more slowly than alpha*fc^y predicts and a centre-frequency TGC
@@ -279,6 +279,20 @@ def to_bmode(env, depth_mm, spec, alpha_power, tgc_db_cm_mhz=0.5, dr_db=55.0):
     A, E, _, _ = spectral_attenuation_lut(spec, alpha_power, a_max=float(tgc_db_cm_mhz / 8.686 * z_cm[-1] * 1.05))
     loss_db = -10 * np.log10(np.interp(tgc_db_cm_mhz / 8.686 * z_cm, A, E))
     db = 20 * np.log10(env + 1e-12) + loss_db[:, None]
+    if auto_tgc:
+        # Operator-style TGC: the nominal slope rarely matches the tissue (fat ~0.4, gland ~0.8
+        # dB/cm/MHz^y here), and sonographers set the sliders until the background is even.
+        # As PyMUST's tgc(): robust linear fit of the per-depth level over the central 80% of
+        # the depth, then remove that linear trend. Row medians ignore bright interfaces and
+        # local shadows, so lesion contrast and posterior features are kept.
+        ok = env > 0
+        med = np.array([np.median(r[m]) if m.sum() > 10 else np.nan for r, m in zip(db, ok)])
+        n = len(med)
+        sel = np.arange(n // 10, 9 * n // 10)
+        sel = sel[np.isfinite(med[sel])]
+        if len(sel) > 20:
+            slope = stats.theilslopes(med[sel], z_cm[sel])[0]
+            db -= (slope * (z_cm - z_cm[sel].mean()))[:, None]
     db -= np.percentile(db, 99.5)
     return (np.clip(db / dr_db + 1, 0, 1) * 255).astype(np.uint8)
 
