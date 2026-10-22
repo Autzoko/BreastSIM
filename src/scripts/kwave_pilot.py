@@ -65,7 +65,7 @@ def choose_poses(n, rng):
             if depth > 40:
                 continue
             poses.append(dict(pid=pid, pose=pose, gap=gap, kind=f"lesion #{les['id']} {les['type']}",
-                              depth=float(np.clip(depth + 12, 25, 45))))
+                              depth=float(np.clip(depth + 12, 25, 45)), focus=float(depth)))
     for pid in ids:
         if len(poses) >= n:
             break
@@ -73,8 +73,8 @@ def choose_poses(n, rng):
         tissue_vox = np.argwhere(np.isin(vol.label, (tissue.GLAND,)))
         target = tissue_vox[rng.integers(len(tissue_vox))] * vol.voxel_mm
         pose, gap, depth = skin_normal_pose(vol, target, spec)
-        poses.append(dict(pid=pid, pose=pose, gap=gap, kind="glandular / normal tissue",
-                          depth=float(np.clip(depth + 12, 25, 40))))
+        d = float(np.clip(depth + 12, 25, 40))
+        poses.append(dict(pid=pid, pose=pose, gap=gap, kind="glandular / normal tissue", depth=d, focus=d / 2))
     return poses[:n]
 
 
@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--strength", type=float, default=0.02, help="scatterer perturbation for echogenicity 1")
     ap.add_argument("--roughness", type=float, default=0.5, help="sub-voxel boundary jitter, source voxels")
     ap.add_argument("--only", default="", help="comma-separated image numbers to render (1-based)")
+    ap.add_argument("--tx", choices=("focused", "plane"), default="focused")
+    ap.add_argument("--angles", default="-8,-4,0,4,8", help="plane-wave angles (deg) for --tx plane")
+    ap.add_argument("--no-conform", action="store_true", help="flat probe face over the curved skin (water wedges)")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -103,10 +106,12 @@ def main():
         pose = ps["pose"]
         print(f"[{k + 1}/{len(poses)}] {ps['pid']} {ps['kind']} depth {ps['depth']:.0f} mm", flush=True)
         kw, lab, info = render_pose(ps["pid"], vol, pose, depth_mm=ps["depth"], scatter_strength=args.strength,
-                                   roughness=args.roughness)
+                                   roughness=args.roughness, tx=args.tx, focus_mm=ps["focus"],
+                                   angles_deg=[float(a) for a in args.angles.split(",")],
+                                   conform=not args.no_conform)
         r.set_volume(vol)
         prev, _, _ = r.render(pose, ImagingParams(probe="L12-hf", depth_mm=ps["depth"], px_x_mm=0.1, px_z_mm=0.1,
-                                                  conform=False, overlay="none", speckle_reduction=0.0))
+                                                  conform=not args.no_conform, overlay="none", speckle_reduction=0.0))
         prev = np.array(Image.fromarray(prev).resize((kw.shape[1], kw.shape[0])))
         gt = tissue.color_lut()[lab]
         sep = np.full((kw.shape[0], 6, 3), 255, np.uint8)
