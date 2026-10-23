@@ -53,6 +53,7 @@ class ImagingParams:
     tx_f_number: float = 2.0          # transmit aperture = focus / F#
     aberration: bool = True           # speed-of-sound delays along the element paths (else ideal c0 beam)
     reverberation: bool = True        # second-order multiple reflections (probe face and interfaces)
+    compound_deg: tuple = ()          # spatial compounding: steering angles (deg) of the averaged frames; () = off
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
     conform: bool = True              # probe presses the skin flat
     shadow_blur_mm: float = 0.0       # extra lateral fill-in of shadows (beam averaging is always applied)
@@ -268,16 +269,20 @@ class PreviewRenderer:
         return f0 + (f1 - f0) * t
 
     # ------------------------------------------------------------ speckle
-    def _speckle(self, origin, axes, offs, nx, nz, dx, dz, width, sigma_y, k2, max_points=8_000_000):
+    def _speckle(self, origin, axes, offs, nx, nz, dx, dz, width, sigma_y, k2, steer=0.0, max_points=8_000_000):
         """Sum of every lattice scatterer inside the elevation beam, splatted to pixels.
 
         Each scatterer is counted once, weighted by the elevation beam profile at
         its true elevation, phased by its true depth along its line and split
         linearly between the two nearest rows, so a small probe move changes the
-        image smoothly. Returns complex (nz, nx), unit variance for echogenicity 1.
+        image smoothly. Lines start at the (conformed) face point of their column and run along
+        e_ax steered by `steer` (rad) towards e_lat. Returns complex (nz, nx), unit variance for
+        echogenicity 1.
         """
         dev, cell = self.device, scatter.SCATTER_CELL_MM
         e_lat, e_ax, e_el = axes
+        cs, sn = float(np.cos(steer)), float(np.sin(steer))
+        d_ln = cs * e_ax + sn * e_lat                  # line direction
         step = cell / np.sqrt(2)                       # dense enough to hit (nearly) every cell
         depth = nz * dz
         # depth chunks sized by the local beam thickness (thin near the elevation focus)
@@ -303,15 +308,19 @@ class PreviewRenderer:
             Z, X, Y = torch.meshgrid(zs, torch.arange(len(xs), device=dev, dtype=zs.dtype), ys, indexing="ij")
             keep = Y.abs() <= 2 * sigma_y(Z.clamp(min=0)) + cell
             Z, X, Y = Z[keep], X[keep].long(), Y[keep]
-            pts = origin + xs[X, None] * e_lat + (Z + xs_off[X])[:, None] * e_ax + Y[:, None] * e_el
+            pts = origin + xs[X, None] * e_lat + xs_off[X][:, None] * e_ax + Z[:, None] * d_ln + Y[:, None] * e_el
             idx = scatter.unique_cells(pts, cell)
             del pts, Z, X, Y, keep
             amp, pos = scatter.from_index(idx, cell, self.seed)
             rel = pos - origin
-            col = torch.round((rel @ e_lat + width / 2) / dx).long()
+            a_lat, b_ax = rel @ e_lat, rel @ e_ax
+            # line through the scatterer: a = x + s sin, b = offs(x) + s cos (one fixed-point step)
+            c0 = torch.round((a_lat + width / 2) / dx).long().clamp(0, nx - 1)
+            x_ln = a_lat - (b_ax - offs[c0]) / cs * sn
+            col = torch.round((x_ln + width / 2) / dx).long()
             ok = (col >= 0) & (col < nx)
-            col, rel, amp, pos = col[ok], rel[ok], amp[ok], pos[ok]
-            zd = rel @ e_ax - offs[col]                                     # depth along its own line
+            col, rel, amp, pos, b_ax = col[ok], rel[ok], amp[ok], pos[ok], b_ax[ok]
+            zd = (b_ax - offs[col]) / cs                                    # depth along its own line
             ok = (zd >= z0) & (zd < z1) & (zd >= 0) & (zd < depth)          # each scatterer in one chunk
             col, zd, amp, pos, yv = col[ok], zd[ok], amp[ok], pos[ok], (rel @ e_el)[ok]
             w = torch.exp(-0.5 * (yv / sigma_y(zd)) ** 2)
@@ -458,89 +467,126 @@ class PreviewRenderer:
         offs = torch.from_numpy(offs_np).to(dev)
         origin = torch.tensor(origin_np, device=dev, dtype=torch.float32)
         e_lat, e_ax, e_el = torch.tensor(axes_np, device=dev, dtype=torch.float32)
-        plane = origin + x[None, :, None] * e_lat + (z[:, None] + offs[None])[..., None] * e_ax   # (nz, nx, 3)
+        def frame(theta):
+            """One steered frame (theta rad): intensity and labels on its own (line x, apparent depth) grid."""
+            d_ln = float(np.cos(theta)) * e_ax + float(np.sin(theta)) * e_lat
+            plane = origin + x[None, :, None] * e_lat + offs[None, :, None] * e_ax + z[:, None, None] * d_ln   # (nz, nx, 3)
 
-        # center plane: labels and speed of sound (display mapping, ground truth)
-        lab_c = self._sample(self._labels, plane, "nearest")[0].long()
-        # bone and air interiors are anechoic and sit behind total shadows: their extreme speeds
-        # are clamped to the soft-tissue range for the delays rather than stretching the display
-        c_c = self._sample(self._props[:, 1:], plane, "bilinear")[0].clamp(1300.0, 1800.0)
+            # center plane: labels and speed of sound (display mapping, ground truth)
+            lab_c = self._sample(self._labels, plane, "nearest")[0].long()
+            # bone and air interiors are anechoic and sit behind total shadows: their extreme speeds
+            # are clamped to the soft-tissue range for the delays rather than stretching the display
+            c_c = self._sample(self._props[:, 1:], plane, "bilinear")[0].clamp(1300.0, 1800.0)
 
-        def sigma_y_lam(depth, lam):
-            """Two-way elevation beam: diffraction at focus (0.886 lam zf / h), geometric off focus."""
-            return torch.sqrt((0.886 * lam * zf / h_el) ** 2 + (h_el * (1 - depth / zf)) ** 2 / 2) / 2.355
+            def sigma_y_lam(depth, lam):
+                """Two-way elevation beam: diffraction at focus (0.886 lam zf / h), geometric off focus."""
+                return torch.sqrt((0.886 * lam * zf / h_el) ** 2 + (h_el * (1 - depth / zf)) ** 2 / 2) / 2.355
 
-        # attenuation, boundary transmission and echoes across the elevation beam
-        k2 = 4 * np.pi / lam0                                                     # 2k at fc, rad/mm
-        spec_echo, att_int, A, r_coh, att_only, bloss = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, e_ax, e_el),
-                                                 dz, k2, p, spec, vol.alpha_power)
-        A_lut, _, fbar_lut, sf_lut = self._att_lut(spec, vol.alpha_power)
-        # per-depth spectral state, weighted by the transmitted intensity: fully shadowed
-        # columns (behind bone or air) contribute nothing visible and must not shift it
-        A_row = (A * att_int).sum(1) / att_int.sum(1).clamp(min=1e-12)
-        lam_row = spec.c * 1e-3 / self._interp(A_lut, fbar_lut, A_row)           # mm, local mean wavelength
-        sig_z_row = spec.c * 1e-3 / (2 * np.pi * self._interp(A_lut, sf_lut, A_row)) / 2
+            # attenuation, boundary transmission and echoes across the elevation beam
+            k2 = 4 * np.pi / lam0                                                     # 2k at fc, rad/mm
+            spec_echo, att_int, A, r_coh, att_only, bloss = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, d_ln, e_el),
+                                                     dz, k2, p, spec, vol.alpha_power)
+            A_lut, _, fbar_lut, sf_lut = self._att_lut(spec, vol.alpha_power)
+            # per-depth spectral state, weighted by the transmitted intensity: fully shadowed
+            # columns (behind bone or air) contribute nothing visible and must not shift it
+            A_row = (A * att_int).sum(1) / att_int.sum(1).clamp(min=1e-12)
+            lam_row = spec.c * 1e-3 / self._interp(A_lut, fbar_lut, A_row)           # mm, local mean wavelength
+            sig_z_row = spec.c * 1e-3 / (2 * np.pi * self._interp(A_lut, sf_lut, A_row)) / 2
 
-        def sigma_y(depth):
-            return sigma_y_lam(depth, lam_row[torch.clamp((depth / dz).long(), 0, nz - 1)])
+            def sigma_y(depth):
+                return sigma_y_lam(depth, lam_row[torch.clamp((depth / dz).long(), 0, nz - 1)])
 
-        speckle = self._speckle(origin, (e_lat, e_ax, e_el), offs, nx, nz, dx, dz, width, sigma_y, k2)
+            speckle = self._speckle(origin, (e_lat, e_ax, e_el), offs, nx, nz, dx, dz, width, sigma_y, k2, steer=theta)
 
-        # PSF: axial width follows the local spectrum (Gaussian envelope); lateral PSF from the
-        # array beam model (focusing, apodization, side lobes, aberration; beam.BeamModel)
-        slow = (1 / (c_c * 1e-3) - 1 / (C0 * 1e-3)) if p.aberration else torch.zeros_like(c_c)   # us/mm
-        bm = BeamModel(spec, slow, x, dz, A_row, vol.alpha_power, p, loss=bloss)
-        # boundary transmission (refraction / edge shadows) averaged over the element paths of the
-        # transmit and receive apertures: shadows of structures smaller than the aperture cone fill
-        # in with depth, as behind real ligaments and lobule margins
-        att_int = att_only * bm.transmission_field(z)
-        kz0 = _gauss_kernel(sig_z0 / dz, dev)
-        sig_x_row = lam_row * torch.clamp(z / width, min=p.lateral_f_number) / 2.355 / dx
-        k2x = bm.per_row(bm.k2sum0, z)                                            # ideal lateral kernel energy per row
-        ref = float((kz0 ** 2).sum() * k2x[0])
-        # sum-normalised kernels lower the (incoherent) speckle energy as the PSF widens with
-        # depth; echo energy is conserved (its loss is E(A)), so restore sum(k^2) per row with the
-        # ideal in-focus kernel: the transmit focal gain, edge truncation and aberration remain.
-        # Coherent boundary echoes are pre-divided so the restoration leaves them unchanged.
-        k2sum = lambda sig: torch.stack([(_gauss_kernel(float(v), dev) ** 2).sum() for v in sig])
-        rows_z = sig_z_row / dz
-        uz = torch.unique(torch.round(rows_z * 20) / 20)
-        energy = ref / (self._interp_vals(uz, k2sum(uz), rows_z) * k2x)
-        # transmitted intensity averaged over the two-way lateral beam (partial shadows)
-        att_int = _banded_conv(att_int, sig_x_row, 1)
-        if p.shadow_blur_mm > 0:                                                  # optional extra fill-in
-            att_int = _conv_along(att_int, _gauss_kernel(p.shadow_blur_mm / dx, dev), 1)
-        # a perpendicular boundary with reflection R peaks at specular * R speckle-rms units;
-        # every echo is attenuated along its own path before it is blurred by the PSF, so a
-        # bright reflector in front of a sudden loss (bone, air) keeps its full peak
-        att_amp = att_int.sqrt()
-        diffuse = speckle * att_amp
-        specular = (p.specular * np.sqrt(ref) / float(kz0.max())) * spec_echo / energy.sqrt()[:, None] * att_amp
-        rf = diffuse + specular
-        if p.reverberation:
-            # multiple reflections of specular echoes stay coherent across the aperture (replicas,
-            # A-lines); those of diffuse scattering are incoherent (Pinton et al. 2014) and the
-            # delay-and-sum gain over speckle, G = 2M/3 for M receive elements (Long et al. 2020),
-            # suppresses them relative to the primary speckle
-            m_rx = torch.clamp(z / p.lateral_f_number, max=width) / (spec.pitch * 1e3)
-            g_das = (2 * m_rx.clamp(min=1.0) / 3)[:, None]
-            rf = (rf + reverberation(specular, r_coh, att_int, spec.face_reflection, dz)
-                  + reverberation(diffuse, r_coh, att_int, spec.face_reflection, dz) / g_das.sqrt())
-        rf = torch.complex(_banded_conv(rf.real, sig_z_row / dz, 0), _banded_conv(rf.imag, sig_z_row / dz, 0))
-        env2 = bm.lateral(rf, z).abs() ** 2 * energy[:, None]                     # intensity (nz, nx)
+            # PSF: axial width follows the local spectrum (Gaussian envelope); lateral PSF from the
+            # array beam model (focusing, apodization, side lobes, aberration; beam.BeamModel)
+            slow = (1 / (c_c * 1e-3) - 1 / (C0 * 1e-3)) if p.aberration else torch.zeros_like(c_c)   # us/mm
+            bm = BeamModel(spec, slow, x, dz, A_row, vol.alpha_power, p, loss=bloss)
+            # boundary transmission (refraction / edge shadows) averaged over the element paths of the
+            # transmit and receive apertures: shadows of structures smaller than the aperture cone fill
+            # in with depth, as behind real ligaments and lobule margins
+            att_int = att_only * bm.transmission_field(z)
+            kz0 = _gauss_kernel(sig_z0 / dz, dev)
+            sig_x_row = lam_row * torch.clamp(z / width, min=p.lateral_f_number) / 2.355 / dx
+            k2x = bm.per_row(bm.k2sum0, z)                                            # ideal lateral kernel energy per row
+            ref = float((kz0 ** 2).sum() * k2x[0])
+            # sum-normalised kernels lower the (incoherent) speckle energy as the PSF widens with
+            # depth; echo energy is conserved (its loss is E(A)), so restore sum(k^2) per row with the
+            # ideal in-focus kernel: the transmit focal gain, edge truncation and aberration remain.
+            # Coherent boundary echoes are pre-divided so the restoration leaves them unchanged.
+            k2sum = lambda sig: torch.stack([(_gauss_kernel(float(v), dev) ** 2).sum() for v in sig])
+            rows_z = sig_z_row / dz
+            uz = torch.unique(torch.round(rows_z * 20) / 20)
+            energy = ref / (self._interp_vals(uz, k2sum(uz), rows_z) * k2x)
+            # transmitted intensity averaged over the two-way lateral beam (partial shadows)
+            att_int = _banded_conv(att_int, sig_x_row, 1)
+            if p.shadow_blur_mm > 0:                                                  # optional extra fill-in
+                att_int = _conv_along(att_int, _gauss_kernel(p.shadow_blur_mm / dx, dev), 1)
+            # a perpendicular boundary with reflection R peaks at specular * R speckle-rms units;
+            # every echo is attenuated along its own path before it is blurred by the PSF, so a
+            # bright reflector in front of a sudden loss (bone, air) keeps its full peak
+            att_amp = att_int.sqrt()
+            diffuse = speckle * att_amp
+            specular = (p.specular * np.sqrt(ref) / float(kz0.max())) * spec_echo / energy.sqrt()[:, None] * att_amp
+            rf = diffuse + specular
+            if p.reverberation:
+                # multiple reflections of specular echoes stay coherent across the aperture (replicas,
+                # A-lines); those of diffuse scattering are incoherent (Pinton et al. 2014) and the
+                # delay-and-sum gain over speckle, G = 2M/3 for M receive elements (Long et al. 2020),
+                # suppresses them relative to the primary speckle
+                m_rx = torch.clamp(z / p.lateral_f_number, max=width) / (spec.pitch * 1e3)
+                g_das = (2 * m_rx.clamp(min=1.0) / 3)[:, None]
+                rf = (rf + reverberation(specular, r_coh, att_int, spec.face_reflection, dz)
+                      + reverberation(diffuse, r_coh, att_int, spec.face_reflection, dz) / g_das.sqrt())
+            rf = torch.complex(_banded_conv(rf.real, sig_z_row / dz, 0), _banded_conv(rf.imag, sig_z_row / dz, 0))
+            env2 = bm.lateral(rf, z).abs() ** 2 * energy[:, None]                     # intensity (nz, nx)
 
-        # display depth: the scanner maps time to depth with c0; echoes arrive late by the
-        # aperture-averaged excess delay of the transmit and receive paths (beam.BeamModel)
-        z_app = torch.cummax(z[:, None] + bm.depth_shift(z), 0).values             # (nz, nx), monotonic
+            # display depth: the scanner maps time to depth with c0; echoes arrive late by the
+            # aperture-averaged excess delay of the transmit and receive paths (beam.BeamModel)
+            z_app = torch.cummax(z[:, None] + bm.depth_shift(z), 0).values             # (nz, nx), monotonic
+            n_app = int(round(p.depth_mm / dz))
+            targets = ((torch.arange(n_app, device=dev, dtype=torch.float32) + 0.5) * dz)
+            zt = z_app.t().contiguous()                                               # (nx, nz)
+            idx = torch.searchsorted(zt, targets.expand(nx, -1).contiguous()).clamp(1, nz - 1)
+            lo, hi = torch.gather(zt, 1, idx - 1), torch.gather(zt, 1, idx)
+            frac = ((targets[None] - lo) / (hi - lo).clamp(min=1e-6)).clamp(0, 1)
+            e2t = env2.t()
+            env2 = (torch.gather(e2t, 1, idx - 1) * (1 - frac) + torch.gather(e2t, 1, idx) * frac).t()
+            lab_c = torch.gather(lab_c.t(), 1, torch.where(frac < 0.5, idx - 1, idx)).t()
+            return env2, lab_c, ref, bm, lam_row
+
         n_app = int(round(p.depth_mm / dz))
-        targets = ((torch.arange(n_app, device=dev, dtype=torch.float32) + 0.5) * dz)
-        zt = z_app.t().contiguous()                                               # (nx, nz)
-        idx = torch.searchsorted(zt, targets.expand(nx, -1).contiguous()).clamp(1, nz - 1)
-        lo, hi = torch.gather(zt, 1, idx - 1), torch.gather(zt, 1, idx)
-        frac = ((targets[None] - lo) / (hi - lo).clamp(min=1e-6)).clamp(0, 1)
-        e2t = env2.t()
-        env2 = (torch.gather(e2t, 1, idx - 1) * (1 - frac) + torch.gather(e2t, 1, idx) * frac).t()
-        lab_c = torch.gather(lab_c.t(), 1, torch.where(frac < 0.5, idx - 1, idx)).t()
+        angles = [np.radians(a) for a in (p.compound_deg or (0.0,))]
+        frames = [frame(t) for t in angles]
+        if len(frames) == 1:
+            env2, lab_c, ref, bm, lam_row = frames[0]
+        else:
+            # spatial compounding: each steered frame to the common (lateral, depth) grid, where the
+            # line of display point (X, Z) starts at X - Z tan(theta) with range Z / cos(theta);
+            # detected amplitudes are averaged over the frames that cover the point
+            zc_app = (torch.arange(n_app, device=dev, dtype=torch.float32) + 0.5) * dz
+            amp_sum = torch.zeros(n_app, nx, device=dev)
+            cnt = torch.zeros(n_app, nx, device=dev)
+            for t, (e2, *_) in zip(angles, frames):
+                xs_src = x[None, :] - zc_app[:, None] * float(np.tan(t))
+                rs_src = (zc_app[:, None] / float(np.cos(t))).expand_as(xs_src)
+                g = torch.stack([(xs_src - x[0]) / (x[-1] - x[0]) * 2 - 1,
+                                 (rs_src / dz - 0.5) / (n_app - 1) * 2 - 1], -1)[None]
+                a_t = F.grid_sample(e2.sqrt()[None, None], g, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
+                inside = ((xs_src >= x[0]) & (xs_src <= x[-1]) & (rs_src < n_app * dz)).float()
+                amp_sum += a_t * inside
+                cnt += inside
+            env2 = (amp_sum / cnt.clamp(min=1)) ** 2
+            k0 = int(np.argmin(np.abs(angles)))
+            _, lab_c, ref, bm, lam_row = frames[k0]
+            if abs(angles[k0]) > 1e-9:
+                t = angles[k0]
+                xs0 = x[None, :] - zc_app[:, None] * float(np.tan(t))
+                g = torch.stack([(xs0 - x[0]) / (x[-1] - x[0]) * 2 - 1,
+                                 ((zc_app[:, None] / float(np.cos(t))).expand_as(xs0) / dz - 0.5) / (n_app - 1) * 2 - 1],
+                                -1)[None]
+                lab_c = F.grid_sample(lab_c.float()[None, None], g, mode="nearest", padding_mode="border",
+                                      align_corners=True)[0, 0].long()
 
         # scan conversion to the preset pixel grid: interpolate the envelope amplitude
         # (area-averaging intensity would smooth the speckle and break its statistics)
