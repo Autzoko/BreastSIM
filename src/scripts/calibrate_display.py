@@ -131,6 +131,7 @@ def main():
     ap.add_argument("--rerender", action="store_true")
     ap.add_argument("--echo", nargs="*", default=[], help="echogenicity overrides, e.g. FAT=0.18")
     ap.add_argument("--gamma-max", type=float, default=4.0)
+    ap.add_argument("--dr-max", type=float, default=100.0, help="upper bound of the displayed dynamic range, dB")
     args = ap.parse_args()
     echo = {getattr(tissue, k): float(v) for k, v in (e.split("=") for e in args.echo)}
     tag = "".join(f"_{e}" for e in args.echo)
@@ -152,7 +153,7 @@ def main():
 
     def loss(theta):
         tgc, gain, dr, gamma = theta
-        if not (0 <= tgc <= 1.5 and -60 <= gain <= 20 and 20 <= dr <= 100 and 0.3 <= gamma <= args.gamma_max):
+        if not (0 <= tgc <= 1.5 and -60 <= gain <= 20 and 20 <= dr <= args.dr_max and 0.3 <= gamma <= args.gamma_max):
             return 1e6
         h, prof = sims.stats(theta)
         return w1(h, h_real) + (float(np.nanmean(np.abs(prof - p_real))) if use_prof else 0.0)
