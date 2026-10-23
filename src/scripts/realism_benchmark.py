@@ -56,18 +56,18 @@ def main():
             tables.append(t)
     rep = pd.concat(tables, ignore_index=True)
     rep.to_csv(paths.OUTPUTS / "realism" / "report.csv", index=False)
-    wide = rep.pivot_table(index=["group", "feature"], columns="version", values="score_mean").round(2)
-    med = rep.drop_duplicates(["group", "feature"]).set_index(["group", "feature"]).filter(like="real_median")
+    wide = rep.pivot_table(index=["part", "group", "feature"], columns="version", values="score_mean").round(2)
+    med = rep.drop_duplicates(["part", "group", "feature"]).set_index(["part", "group", "feature"]).filter(like="real_median")
     wide["real_medians (" + " / ".join(c.split(":")[1] for c in med.columns) + ")"] = med.apply(
         lambda r: " / ".join("-" if pd.isna(v) else f"{v:.3g}" for v in r), axis=1)
-    sim_med = rep.pivot_table(index=["group", "feature"], columns="version", values="sim_median")
+    sim_med = rep.pivot_table(index=["part", "group", "feature"], columns="version", values="sim_median")
     for v in args.versions:
         wide[f"median:{v}"] = sim_med[v].map(lambda x: f"{x:.3g}")
     pd.set_option("display.width", 250)
     pd.set_option("display.max_rows", 200)
     print(wide.to_string())
-    print("\nmean score per group:")
-    print(rep.groupby(["version", "group"]).score_mean.median().unstack().round(2).to_string())
+    print("\nmedian score per part / group (imaging: used to tune the imaging chain; content: phantom-driven):")
+    print(rep.groupby(["version", "part", "group"]).score_mean.median().unstack([1, 2]).round(2).to_string())
 
 
 if __name__ == "__main__":

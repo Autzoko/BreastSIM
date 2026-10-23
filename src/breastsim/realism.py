@@ -39,6 +39,13 @@ from . import paths
 
 TARGET_MM = 0.1                                   # texture features at 0.1 mm/px
 ABUS_SPACING = (0.476, 0.073, 0.2)                # TDSC-ABUS 2023 (sweep, depth, lateral), mm (breastsim.presets)
+# which part of the simulation a feature reflects: "imaging" features are used to tune the imaging
+# chain; "content" features depend mostly on the phantom (anatomy, lesion morphology) and are only
+# reported, so that the imaging chain is never tuned to stand in for missing anatomy
+CONTENT = {"tex_aniso", "tex_coherence", "tex_horiz_frac", "tex_mottling", "tex_psd_mid", "banding",
+           "layer_transitions_per_cm", "layer_thickness_mm", "layer_continuity", "ridge_density", "ridge_length_mm",
+           "ridge_horiz_frac", "distractors_per_cm2", "eqdiam_mm", "depth_mm", "h_over_w", "angle_deg", "solidity",
+           "circularity", "irregularity", "rel_area", "halo_sd"}
 SCALED = {"tex_psd_high", "tex_psd_mid", "tex_slope", "tex_aniso", "tex_horiz_frac", "tex_coherence", "tex_mottling",
           "spk_axial_mm_top", "spk_axial_mm_mid", "spk_axial_mm_deep", "spk_lateral_mm_top", "spk_lateral_mm_mid",
           "spk_lateral_mm_deep", "banding", "layer_transitions_per_cm", "layer_thickness_mm", "layer_continuity",
@@ -249,7 +256,7 @@ def image_features(g, m, scaled):
             for i, j in _tiles(m):
                 if not (r0 + a * (r1 - r0) <= i + T / 2 < r0 + b * (r1 - r0)):
                     continue
-                if coh[i:i + T, j:j + T].mean() > 0.35 or lm[i:i + T, j:j + T].std() > 0.25 * g[i:i + T, j:j + T].std():
+                if coh[i:i + T, j:j + T].mean() > 0.5 or lm[i:i + T, j:j + T].std() > 0.4 * g[i:i + T, j:j + T].std():
                     continue
                 t = g[i:i + T, j:j + T]
                 d = t - ndi.gaussian_filter(t, 8)
@@ -375,10 +382,13 @@ def extract(samples, dataset, log=print):
     for k, s in enumerate(samples):
         g, les, px = s["gray"], s["lesion"], s["px_mm"]
         valid = tissue_mask(g, s["bad"])
+        # lesions: the largest mask component and any other of at least a quarter of its area (2D
+        # sections of spiculated masses leave detached spicule fragments)
         lab, n = ndi.label(les)
+        sizes = ndi.sum(les, lab, range(1, n + 1)) if n else []
         for c in range(1, n + 1):
             comp = lab == c
-            if comp.sum() >= 50:
+            if sizes[c - 1] >= max(50, 0.25 * max(sizes)):
                 try:
                     lesions.append(dict(dataset=dataset, id=s["id"], **s["info"], **lesion_features(g, comp, valid, px)))
                 except Exception as e:  # degenerate masks
@@ -415,7 +425,8 @@ def score(real, sim, kind, min_n=10):
             continue
         names = sorted(have)
         yard = np.median([w1(have[a], have[b]) for i, a in enumerate(names) for b in names[i + 1:]])
-        row = dict(group=kind, feature=f, sim_median=s.median(), yardstick=yard)
+        row = dict(group=kind, part="content" if f in CONTENT else "imaging", feature=f, sim_median=s.median(),
+                   yardstick=yard)
         for k in names:
             row[f"real_median:{k}"] = have[k].median()
             row[f"score:{k}"] = w1(s, have[k]) / max(yard, 1e-9)
