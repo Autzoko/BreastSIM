@@ -44,7 +44,8 @@ class ImagingParams:
     px_z_mm: float = 0.078            # output pixel spacing in depth
     gain_db: float = -13.0
     dynamic_range_db: float = 52.0
-    tgc_db_cm_mhz: float = 0.5        # depth gain compensation (one-way slope at fc)
+    tgc_db_cm_mhz: float = 0.5        # TGC: compensates this one-way attenuation (dB/cm/MHz^y) over the pulse spectrum
+    gray_gamma: float = 1.0           # display gray map: gray = (compressed level in [0, 1]) ** gamma
     specular: float = 30.0            # perpendicular boundary echo = specular * R * (speckle rms of echogenicity 1)
     lateral_f_number: float = 2.0     # minimum receive F-number
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
@@ -59,8 +60,8 @@ class ImagingParams:
     def from_preset(cls, name, **overrides):
         p = PRESETS[name]
         fields = {k: getattr(p, k) for k in ("probe", "depth_mm", "px_x_mm", "px_z_mm", "gain_db",
-                                             "dynamic_range_db", "speckle_reduction",
-                                             "lateral_f_number", "conform")}
+                                             "dynamic_range_db", "tgc_db_cm_mhz", "gray_gamma",
+                                             "speckle_reduction", "lateral_f_number", "conform")}
         return cls(**{**fields, "preset": name, **overrides})
 
 
@@ -152,6 +153,21 @@ def lesion_alpha(vol):
     return np.where(np.isfinite(over), over, vol.alpha.astype(np.float32))
 
 
+def display_map(env2, ref, p):
+    """Linear echo intensity (after TGC) -> display level in [0, 1].
+
+    Vendor-style speckle smoothing on the amplitude (not on dB, where averaging a thin bright
+    reflector with the black shadow behind it would erase the reflector), log compression to
+    the dynamic range with the gain offset (as PyMUST bmode / k-Wave logCompression), then a
+    power-law gray map.
+    """
+    if p.speckle_reduction > 0:
+        ks = _gauss_kernel(p.speckle_reduction, env2.device)
+        env2 = _conv_along(_conv_along(env2.sqrt(), ks, 0), ks, 1) ** 2
+    db = 10 * torch.log10(env2 / ref + 1e-12)
+    return torch.clamp((db + p.gain_db) / p.dynamic_range_db + 1, 0, 1) ** p.gray_gamma
+
+
 # ----------------------------------------------------------------- renderer
 class PreviewRenderer:
     def __init__(self, device=None):
@@ -214,6 +230,18 @@ class PreviewRenderer:
             A, E, fbar, sf = spectral_attenuation_lut(spec, power)
             self._att_luts[key] = [torch.tensor(a, device=self.device, dtype=torch.float32) for a in (A, E, fbar, sf)]
         return self._att_luts[key]
+
+    def tgc_gain(self, spec, power, depth_mm, slope_db_cm_mhz):
+        """Intensity gain of the TGC curve at displayed depths (tensor, mm).
+
+        Compensates a medium of the given one-way power-law attenuation for this probe's
+        pulse-echo spectrum, including the downshift of the mean frequency with depth:
+        gain = 1 / E(A), A = slope * depth (k-Wave's B-mode example compensates the same
+        slope at fc only, which overcorrects deep echoes by the downshift).
+        """
+        A_lut, E_lut, _, _ = self._att_lut(spec, power)
+        A = slope_db_cm_mhz * 100 * NP_PER_DB * depth_mm * 1e-3                   # Np / MHz^y, one way
+        return 1 / self._interp(A_lut, E_lut, A).clamp(min=1e-30)
 
     @staticmethod
     def _interp(lut_x, lut_y, x):
@@ -476,8 +504,6 @@ class PreviewRenderer:
         e2t = env2.t()
         env2 = (torch.gather(e2t, 1, idx - 1) * (1 - frac) + torch.gather(e2t, 1, idx) * frac).t()
         lab_c = torch.gather(lab_c.t(), 1, torch.where(frac < 0.5, idx - 1, idx)).t()
-        # TGC is a function of receive time, i.e. of displayed depth
-        env2 = env2 * torch.exp(4 * p.tgc_db_cm_mhz * 100 * NP_PER_DB * fc * targets[:, None] * 1e-3)
 
         # scan conversion to the preset pixel grid: interpolate the envelope amplitude
         # (area-averaging intensity would smooth the speckle and break its statistics)
@@ -492,14 +518,12 @@ class PreviewRenderer:
                 amp = _conv_along(amp, _gauss_kernel(0.42 * ratio, dev), dim)
         env2 = _resize_axis(_resize_axis(amp, out_h, 0, "linear"), out_w, 1, "linear") ** 2
         lab_o = _resize_axis(_resize_axis(lab_c.float(), out_h, 0, "nearest"), out_w, 1, "nearest").long()
+        # TGC is a function of receive time, i.e. of displayed depth
+        z_out = (torch.arange(out_h, device=dev, dtype=torch.float32) + 0.5) * (p.depth_mm / out_h)
+        env2 = env2 * self.tgc_gain(spec, vol.alpha_power, z_out, p.tgc_db_cm_mhz)[:, None]
         self.last_intensity = env2       # linear echo intensity before compression (validation)
-        if p.speckle_reduction > 0:
-            # vendor-style speckle smoothing on the amplitude (not on dB, where averaging a thin
-            # bright reflector with the black shadow behind it would erase the reflector)
-            ks = _gauss_kernel(p.speckle_reduction, dev)
-            env2 = _conv_along(_conv_along(env2.sqrt(), ks, 0), ks, 1) ** 2
-        db = 10 * torch.log10(env2 / ref + 1e-12)
-        img = torch.clamp((db + p.gain_db) / p.dynamic_range_db + 1, 0, 1)
+        self.last_ref = ref              # intensity of a unit-echogenicity speckle at 0 dB
+        img = display_map(env2, ref, p)
         rgb = (img[..., None] * 255).expand(-1, -1, 3).clone()
 
         mask = self.lesion_lut[lab_o]

@@ -27,6 +27,7 @@ const IMG_SLIDERS = [
   ["gain_db", "gain dB", -40, 20, 1],
   ["dynamic_range_db", "DR dB", 30, 80, 1],
   ["tgc_db_cm_mhz", "TGC", 0, 1.5, 0.05],
+  ["gray_gamma", "gray γ", 0.3, 3, 0.05],
   ["specular", "specular", 0, 100, 1],
   ["speckle_reduction", "smooth", 0, 3, 0.1],
   ["lateral_f_number", "F#", 1, 4, 0.1],
@@ -34,7 +35,7 @@ const IMG_SLIDERS = [
   ["shadow_blur_mm", "shadow fill", 0, 4, 0.1],
 ];
 const PRESET_KEYS = ["probe", "depth_mm", "px_x_mm", "px_z_mm", "gain_db", "dynamic_range_db",
-  "speckle_reduction", "lateral_f_number", "conform"];
+  "tgc_db_cm_mhz", "gray_gamma", "speckle_reduction", "lateral_f_number", "conform"];
 
 const syncers = [];
 function slider(parent, obj, [key, name, min, max, step]) {

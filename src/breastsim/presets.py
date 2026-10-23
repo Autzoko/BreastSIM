@@ -28,7 +28,9 @@ class ScanPreset:
     dynamic_range_db: float
     speckle_reduction: float     # Gaussian sigma (output px) on the log image, vendor-style smoothing
     lateral_f_number: float
-    conform: bool = True         # probe presses the skin flat
+    conform: bool = True
+    tgc_db_cm_mhz: float = 0.5   # TGC slope (one way, dB/cm/MHz^y)
+    gray_gamma: float = 1.0      # display gray map exponent         # probe presses the skin flat
     sweep_step_mm: float = 0.0   # ABUS frame spacing (data generation)
     notes: str = ""
 
