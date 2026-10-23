@@ -43,8 +43,11 @@ PRESETS = {p.name: p for p in [
                notes="handheld, 50 mm footprint, ~500x500 px"),
     ScanPreset("busbra", "BUS-BRA-like (Logiq 5/7, 10-14 MHz)", "L12-hf", 35.0, 0.1, 0.1, -13, 50, 0.8, 2.0,
                notes="handheld; dataset images are lesion-centred crops"),
-    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -13, 52, 1.0, 2.0,
-               notes="handheld multi-vendor, native pixel size"),
+    # display chain fitted to BrEaST (src/scripts/calibrate_display.py, 2026-10-23, 72 frames vs 256
+    # images: gray-histogram W1 69.6 -> 2.5 levels). gamma sits at the fit bound: gain / DR / gamma
+    # trade off, and the remaining gap is image content (too few sparse bright sheets), not the map
+    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -13.3, 66.6, 1.0, 2.0,
+               tgc_db_cm_mhz=0.67, gray_gamma=4.0, notes="handheld multi-vendor, native pixel size"),
     ScanPreset("tdsc_abus", "TDSC-ABUS-like (15.4 cm ABUS)", "ABUS-15", 44.4, 0.2, 0.073, -12, 50, 0.6, 2.0,
                sweep_step_mm=0.476, notes="automated sweep, 0.2 x 0.073 mm, 0.476 mm frames"),
     ScanPreset("l11_5v", "Verasonics L11-5v (PyMUST reference)", "L11-5v", 40.0, 0.1, 0.1, -12, 55, 0.0, 2.0,
