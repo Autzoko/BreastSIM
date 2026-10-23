@@ -9,7 +9,7 @@
    normal-tissue views, random positions / rotations) with TGC off and keeps the linear echo
    intensity (cached in outputs/calib/<preset>/frames.npz).
 2. Takes the real targets on tissue pixels (lesions dilated and excluded, as in
-   breastsim.imstats): the gray-level distribution (every image weighted equally) and the
+   breastsim.realism): the gray-level distribution (every image weighted equally) and the
    median depth profile (10 bins from the skin to the bottom of the tissue region).
 3. Minimises W1(gray histograms) + mean |depth-profile difference| (both in gray levels) over
    (tgc_db_cm_mhz, gain_db, dynamic_range_db, gray_gamma), Nelder-Mead from a grid of starts.
@@ -27,7 +27,7 @@ import torch
 from scipy import ndimage as ndi
 from scipy.optimize import minimize
 
-from breastsim import imstats, paths, phantom, realdata, tissue
+from breastsim import paths, phantom, realism, tissue
 from breastsim.probe import PROBES, ProbePose
 from breastsim.realtime.renderer import ImagingParams, PreviewRenderer, _conv_along, _gauss_kernel
 
@@ -36,15 +36,16 @@ BINS = np.arange(257) - 0.5
 
 def real_targets(dataset, limit=None):
     hists, profs = [], []
-    for k, (_, g, bad, _) in enumerate(realdata.READERS[dataset]()):
+    for k, smp in enumerate(realism.READERS[dataset]()):
         if limit and k >= limit:
             break
-        m = imstats.tissue_mask(g, bad)
+        g = smp["gray"]
+        m = realism.tissue_mask(g, smp["bad"]) & ~ndi.binary_dilation(smp["lesion"], iterations=15)
         if m.sum() < 4000:
             continue
         h = np.histogram(g[m], BINS)[0]
         hists.append(h / h.sum())
-        profs.append(imstats.depth_profile(g, m))
+        profs.append(realism.depth_profile(g, m))
     return np.mean(hists, 0), np.nanmedian(np.array(profs), 0), len(hists)
 
 
@@ -115,7 +116,7 @@ class SimSet:
             g, m = g.cpu().numpy(), m.cpu().numpy()
             h = np.histogram(g[m], BINS)[0]
             hists.append(h / h.sum())
-            profs.append(imstats.depth_profile(g, m))
+            profs.append(realism.depth_profile(g, m))
         return np.mean(hists, 0), np.nanmedian(np.array(profs), 0)
 
 
@@ -126,7 +127,7 @@ def w1(h1, h2):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--preset", default="breast")
-    ap.add_argument("--dataset", default="BrEaST", choices=list(realdata.READERS))
+    ap.add_argument("--dataset", default="BrEaST", choices=list(realism.READERS))
     ap.add_argument("--no-profile", action="store_true", help="fit the histogram only (cropped datasets)")
     ap.add_argument("--rerender", action="store_true")
     ap.add_argument("--echo", nargs="*", default=[], help="echogenicity overrides, e.g. FAT=0.18")
