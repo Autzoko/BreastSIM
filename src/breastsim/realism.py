@@ -256,7 +256,7 @@ def image_features(g, m, scaled):
             for i, j in _tiles(m):
                 if not (r0 + a * (r1 - r0) <= i + T / 2 < r0 + b * (r1 - r0)):
                     continue
-                if coh[i:i + T, j:j + T].mean() > 0.5 or lm[i:i + T, j:j + T].std() > 0.4 * g[i:i + T, j:j + T].std():
+                if coh[i:i + T, j:j + T].mean() > 0.6 or lm[i:i + T, j:j + T].std() > 0.6 * g[i:i + T, j:j + T].std():
                     continue
                 t = g[i:i + T, j:j + T]
                 d = t - ndi.gaussian_filter(t, 8)
