@@ -275,21 +275,23 @@ class PreviewRenderer:
         Each scatterer is counted once, weighted by the elevation beam profile at
         its true elevation, phased by its true depth along its line and split
         linearly between the two nearest rows, so a small probe move changes the
-        image smoothly. Lines start at the (conformed) face point of their column and run along
-        e_ax steered by `steer` (rad) towards e_lat. Returns complex (nz, nx), unit variance for
-        echogenicity 1.
+        image smoothly. Display coordinates (X along the array, Zd below the face) map to the
+        tissue through the conform warp, point = origin + X e_lat + (Zd + offs(X)) e_ax; lines are
+        straight in display space, from face point x at `steer` (rad): X = x + z sin, Zd = z cos.
+        Returns complex (nz, nx), unit variance for echogenicity 1.
         """
         dev, cell = self.device, scatter.SCATTER_CELL_MM
         e_lat, e_ax, e_el = axes
         cs, sn = float(np.cos(steer)), float(np.sin(steer))
-        d_ln = cs * e_ax + sn * e_lat                  # line direction
         step = cell / np.sqrt(2)                       # dense enough to hit (nearly) every cell
         depth = nz * dz
         # depth chunks sized by the local beam thickness (thin near the elevation focus)
         zgrid = torch.linspace(0, depth, 256, device=dev)
         half = (2 * sigma_y(zgrid) + cell).cpu().numpy()       # half slab thickness per depth
         zg = zgrid.cpu().numpy()
-        xs = torch.arange(-width / 2 - cell, width / 2 + cell, step, device=dev)
+        reach = depth * abs(sn)                        # lateral reach of steered lines
+        xs = torch.arange(-width / 2 - cell - (reach if sn < 0 else 0), width / 2 + cell + (reach if sn > 0 else 0),
+                          step, device=dev)
         x_cols = torch.linspace(-width / 2, width / 2, nx, device=dev)
         xs_off = torch.from_numpy(np.interp(xs.cpu().numpy(), x_cols.cpu().numpy(), offs.cpu().numpy())).to(dev, torch.float32)
         re = torch.zeros((nz + 1) * nx, device=dev)
@@ -300,7 +302,7 @@ class PreviewRenderer:
             z1, ny = z0, 0.0
             while z1 < depth:
                 ny = max(ny, float(np.interp(min(depth, z1 + 0.5), zg, half)), float(np.interp(z1, zg, half)))
-                if (z1 + 0.5 - z0 + 2 * cell) * (width + 2 * cell) * 2 * ny / step ** 3 > max_points and z1 > z0:
+                if (z1 + 0.5 - z0 + 2 * cell) * (width + reach + 2 * cell) * 2 * ny / step ** 3 > max_points and z1 > z0:
                     break
                 z1 = min(depth, z1 + 0.5)
             zs = torch.arange(max(-cell, z0 - cell), z1 + cell, step, device=dev)
@@ -308,19 +310,20 @@ class PreviewRenderer:
             Z, X, Y = torch.meshgrid(zs, torch.arange(len(xs), device=dev, dtype=zs.dtype), ys, indexing="ij")
             keep = Y.abs() <= 2 * sigma_y(Z.clamp(min=0)) + cell
             Z, X, Y = Z[keep], X[keep].long(), Y[keep]
-            pts = origin + xs[X, None] * e_lat + xs_off[X][:, None] * e_ax + Z[:, None] * d_ln + Y[:, None] * e_el
+            pts = origin + xs[X, None] * e_lat + (Z * cs + xs_off[X])[:, None] * e_ax + Y[:, None] * e_el
             idx = scatter.unique_cells(pts, cell)
             del pts, Z, X, Y, keep
             amp, pos = scatter.from_index(idx, cell, self.seed)
             rel = pos - origin
-            a_lat, b_ax = rel @ e_lat, rel @ e_ax
-            # line through the scatterer: a = x + s sin, b = offs(x) + s cos (one fixed-point step)
-            c0 = torch.round((a_lat + width / 2) / dx).long().clamp(0, nx - 1)
-            x_ln = a_lat - (b_ax - offs[c0]) / cs * sn
-            col = torch.round((x_ln + width / 2) / dx).long()
+            a_lat = rel @ e_lat
+            fi = ((a_lat + width / 2) / dx).clamp(0, nx - 1 - 1e-4)       # warp at the scatterer's own X
+            i0 = fi.long()
+            off_a = offs[i0] * (1 - (fi - i0)) + offs[i0 + 1] * (fi - i0)
+            zd_all = (rel @ e_ax - off_a) / cs                              # range along its line
+            col = torch.round((a_lat - zd_all * sn + width / 2) / dx).long()
             ok = (col >= 0) & (col < nx)
-            col, rel, amp, pos, b_ax = col[ok], rel[ok], amp[ok], pos[ok], b_ax[ok]
-            zd = (b_ax - offs[col]) / cs                                    # depth along its own line
+            col, rel, amp, pos, zd_all = col[ok], rel[ok], amp[ok], pos[ok], zd_all[ok]
+            zd = zd_all                                                     # depth along its own line
             ok = (zd >= z0) & (zd < z1) & (zd >= 0) & (zd < depth)          # each scatterer in one chunk
             col, zd, amp, pos, yv = col[ok], zd[ok], amp[ok], pos[ok], (rel @ e_el)[ok]
             w = torch.exp(-0.5 * (yv / sigma_y(zd)) ** 2)
@@ -470,7 +473,12 @@ class PreviewRenderer:
         def frame(theta):
             """One steered frame (theta rad): intensity and labels on its own (line x, apparent depth) grid."""
             d_ln = float(np.cos(theta)) * e_ax + float(np.sin(theta)) * e_lat
-            plane = origin + x[None, :, None] * e_lat + offs[None, :, None] * e_ax + z[:, None, None] * d_ln   # (nz, nx, 3)
+            # display point of each line sample, then the conform warp at its own lateral position
+            Xd = x[None, :] + z[:, None] * float(np.sin(theta))
+            fi = ((Xd + width / 2) / dx).clamp(0, nx - 1 - 1e-4)
+            i0 = fi.long()
+            off_X = offs[i0] * (1 - (fi - i0)) + offs[i0 + 1] * (fi - i0)
+            plane = origin + Xd[..., None] * e_lat + (z[:, None] * float(np.cos(theta)) + off_X)[..., None] * e_ax
 
             # center plane: labels and speed of sound (display mapping, ground truth)
             lab_c = self._sample(self._labels, plane, "nearest")[0].long()
@@ -573,10 +581,13 @@ class PreviewRenderer:
                 g = torch.stack([(xs_src - x[0]) / (x[-1] - x[0]) * 2 - 1,
                                  (rs_src / dz - 0.5) / (n_app - 1) * 2 - 1], -1)[None]
                 a_t = F.grid_sample(e2.sqrt()[None, None], g, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
-                inside = ((xs_src >= x[0]) & (xs_src <= x[-1]) & (rs_src < n_app * dz)).float()
+                # steered frames fade out over 3 mm towards the ends of their coverage (no seams)
+                ramp = 3.0 if abs(t) > 1e-9 else 1e-6
+                inside = (((xs_src - x[0]) / ramp).clamp(0, 1) * ((x[-1] - xs_src) / ramp).clamp(0, 1)
+                          * (rs_src < (n_app - 1) * dz).float())
                 amp_sum += a_t * inside
                 cnt += inside
-            env2 = (amp_sum / cnt.clamp(min=1)) ** 2
+            env2 = (amp_sum / cnt.clamp(min=1e-6)) ** 2
             k0 = int(np.argmin(np.abs(angles)))
             _, lab_c, ref, bm, lam_row = frames[k0]
             if abs(angles[k0]) > 1e-9:
