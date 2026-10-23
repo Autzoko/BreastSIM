@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import scatter, tissue
+from .beam import BeamModel, probe_spectrum, reverberation
 from ..presets import DEFAULT_PRESET, PRESETS
 from ..probe import PROBES, ProbePose, skin_offsets
 
@@ -47,7 +48,11 @@ class ImagingParams:
     tgc_db_cm_mhz: float = 0.5        # TGC: compensates this one-way attenuation (dB/cm/MHz^y) over the pulse spectrum
     gray_gamma: float = 1.0           # display gray map: gray = (compressed level in [0, 1]) ** gamma
     specular: float = 30.0            # perpendicular boundary echo = specular * R * (speckle rms of echogenicity 1)
-    lateral_f_number: float = 2.0     # minimum receive F-number
+    lateral_f_number: float = 2.0     # receive F-number (dynamic aperture z / F#, limited by the array)
+    tx_focus_mm: float = 0.0          # transmit focal depth; 0 = focused at every depth (multi-zone scanners)
+    tx_f_number: float = 2.0          # transmit aperture = focus / F#
+    aberration: bool = True           # speed-of-sound delays along the element paths (else ideal c0 beam)
+    reverberation: bool = True        # second-order multiple reflections (probe face and interfaces)
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
     conform: bool = True              # probe presses the skin flat
     shadow_blur_mm: float = 0.0       # extra lateral fill-in of shadows (beam averaging is always applied)
@@ -119,15 +124,15 @@ def spectral_attenuation_lut(spec, power, n=512, a_max=3.0):
     """Pulse-echo spectrum after power-law attenuation, as a function of the
     one-way path integral A = int alpha0 ds (Np / MHz^y).
 
-    Amplitude spectrum S(f) = exp(-(f-fc)^2 / (2 sf^2)), sf = B fc / 2.355
-    (B = -6 dB pulse-echo fractional bandwidth); received S(f) exp(-2 A f^y).
+    Pulse-echo amplitude spectrum S(f) of MUST / PyMUST (beam.probe_spectrum: generalized
+    normal probe response with the -6 dB fractional bandwidth, one-cycle excitation);
+    received S(f) exp(-2 A f^y).
     Returns A grid and, per A: intensity factor E(A) relative to A = 0,
     centroid frequency (MHz) and amplitude-spectrum sigma (MHz).
     """
     fc = spec.fc / 1e6
-    sf = spec.bandwidth * fc / 2.355
-    f = np.linspace(max(1e-3, fc - 6 * sf), fc + 6 * sf, 2048)
-    s2 = np.exp(-((f - fc) ** 2) / sf ** 2)                       # |S|^2
+    f = np.linspace(1e-3, 2 * fc, 2048)
+    s2 = probe_spectrum(f, spec) ** 2                             # |S|^2
     A = np.linspace(0, a_max, n)
     P = s2[None] * np.exp(-4 * A[:, None] * f[None] ** power)
     tot = P.sum(1)
@@ -344,7 +349,10 @@ class PreviewRenderer:
         Attenuation is integrated per plane (one-way A = int alpha ds) and turned into
         intensity with the spectral LUT; planes are averaged in intensity with the
         elevation beam weights. Returns (echo complex (nz, nx), intensity factor
-        (nz, nx), weighted A (nz, nx)).
+        (nz, nx), weighted A (nz, nx), coherent specular reflection complex (nz, nx)).
+        The last one is r times the specular lobe only, without the diffuse share: it drives
+        the multiple reflections (rough bone scatters its energy away and casts clean
+        shadows, the smooth pleura reverberates).
         """
         dev = self.device
         e_lat, e_ax, e_el = axes
@@ -352,6 +360,8 @@ class PreviewRenderer:
         A_lut, E_lut, _, _ = self._att_lut(spec, power)
         out_re = torch.zeros(nz + 1, nx, device=dev)
         out_im = torch.zeros(nz + 1, nx, device=dev)
+        coh_re = torch.zeros(nz + 1, nx, device=dev)
+        coh_im = torch.zeros(nz + 1, nx, device=dev)
         inten = torch.zeros(nz, nx, device=dev)
         a_mean = torch.zeros(nz, nx, device=dev)
         n = max(1, p.elevation_samples)
@@ -406,11 +416,13 @@ class PreviewRenderer:
                 zb = (iz + 1).float() * dz                                         # boundary depth
                 # the echo leaves before the transmission loss of this crossing: last row above it
                 amp = w * r * factor
-                for o, comp in ((out_re, amp * torch.cos(k2 * zb)), (out_im, amp * torch.sin(k2 * zb))):
+                coh = w * r * (1 - s_diff) * torch.exp(-0.5 * (theta / theta0) ** 2)
+                cs, sn = torch.cos(k2 * zb), torch.sin(k2 * zb)
+                for o, comp in ((out_re, amp * cs), (out_im, amp * sn), (coh_re, coh * cs), (coh_im, coh * sn)):
                     o.index_put_((iz, ix), comp, accumulate=True)
             inten += w * self._interp(A_lut, E_lut, A) * torch.exp(-torch.cumsum(loss, 0))
             a_mean += w * A
-        return torch.complex(out_re[:nz], out_im[:nz]), inten, a_mean
+        return torch.complex(out_re[:nz], out_im[:nz]), inten, a_mean, torch.complex(coh_re[:nz], coh_im[:nz])
 
     # ------------------------------------------------------------- render
     @torch.no_grad()
@@ -422,8 +434,8 @@ class PreviewRenderer:
         lam0 = spec.wavelength * 1e3                     # mm at fc
         width, h_el, zf = spec.aperture * 1e3, spec.height * 1e3, spec.elev_focus * 1e3
         fc = spec.fc / 1e6
-        sig_f0 = spec.bandwidth * fc / 2.355             # MHz, amplitude pulse-echo spectrum
-        sig_z0 = spec.c * 1e-3 / (2 * np.pi * sig_f0) / 2  # mm, two-way envelope sigma at fc
+        sig_f0 = float(self._att_lut(spec, vol.alpha_power)[3][0])   # MHz, amplitude pulse-echo spectrum sigma
+        sig_z0 = spec.c * 1e-3 / (2 * np.pi * sig_f0) / 2  # mm, two-way envelope sigma at the probe face
         dz = float(np.clip(sig_z0 / 1.5, 0.02, 0.05))     # internal axial sampling
         dx = float(np.clip(p.px_x_mm, 0.1, 0.2))          # internal lateral sampling
         nx = int(round(width / dx)) + 1
@@ -442,7 +454,9 @@ class PreviewRenderer:
 
         # center plane: labels and speed of sound (display mapping, ground truth)
         lab_c = self._sample(self._labels, plane, "nearest")[0].long()
-        c_c = self._sample(self._props[:, 1:], plane, "bilinear")[0]
+        # bone and air interiors are anechoic and sit behind total shadows: their extreme speeds
+        # are clamped to the soft-tissue range for the delays rather than stretching the display
+        c_c = self._sample(self._props[:, 1:], plane, "bilinear")[0].clamp(1300.0, 1800.0)
 
         def sigma_y_lam(depth, lam):
             """Two-way elevation beam: diffraction at focus (0.886 lam zf / h), geometric off focus."""
@@ -450,7 +464,7 @@ class PreviewRenderer:
 
         # attenuation, boundary transmission and echoes across the elevation beam
         k2 = 4 * np.pi / lam0                                                     # 2k at fc, rad/mm
-        spec_echo, att_int, A = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, e_ax, e_el),
+        spec_echo, att_int, A, r_coh = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, e_ax, e_el),
                                                  dz, k2, p, spec, vol.alpha_power)
         A_lut, _, fbar_lut, sf_lut = self._att_lut(spec, vol.alpha_power)
         # per-depth spectral state, weighted by the transmitted intensity: fully shadowed
@@ -464,17 +478,22 @@ class PreviewRenderer:
 
         speckle = self._speckle(origin, (e_lat, e_ax, e_el), offs, nx, nz, dx, dz, width, sigma_y, k2)
 
-        # PSF: axial and lateral widths follow the local spectrum
+        # PSF: axial width follows the local spectrum (Gaussian envelope); lateral PSF from the
+        # array beam model (focusing, apodization, side lobes, aberration; beam.BeamModel)
+        slow = (1 / (c_c * 1e-3) - 1 / (C0 * 1e-3)) if p.aberration else torch.zeros_like(c_c)   # us/mm
+        bm = BeamModel(spec, slow, x, dz, A_row, vol.alpha_power, p)
         kz0 = _gauss_kernel(sig_z0 / dz, dev)
         sig_x_row = lam_row * torch.clamp(z / width, min=p.lateral_f_number) / 2.355 / dx
-        ref = float((kz0 ** 2).sum() * (_gauss_kernel(float(sig_x_row[0]), dev) ** 2).sum())
+        k2x = bm.per_row(bm.k2sum0, z)                                            # ideal lateral kernel energy per row
+        ref = float((kz0 ** 2).sum() * k2x[0])
         # sum-normalised kernels lower the (incoherent) speckle energy as the PSF widens with
-        # depth; echo energy is conserved (its loss is E(A)), so restore sum(k^2) per row.
+        # depth; echo energy is conserved (its loss is E(A)), so restore sum(k^2) per row with the
+        # ideal in-focus kernel: the transmit focal gain, edge truncation and aberration remain.
         # Coherent boundary echoes are pre-divided so the restoration leaves them unchanged.
         k2sum = lambda sig: torch.stack([(_gauss_kernel(float(v), dev) ** 2).sum() for v in sig])
-        rows_z, rows_x = sig_z_row / dz, sig_x_row
-        uz, ux = torch.unique(torch.round(rows_z * 20) / 20), torch.unique(torch.round(rows_x * 20) / 20)
-        energy = ref / (self._interp_vals(uz, k2sum(uz), rows_z) * self._interp_vals(ux, k2sum(ux), rows_x))
+        rows_z = sig_z_row / dz
+        uz = torch.unique(torch.round(rows_z * 20) / 20)
+        energy = ref / (self._interp_vals(uz, k2sum(uz), rows_z) * k2x)
         # transmitted intensity averaged over the two-way lateral beam (partial shadows)
         att_int = _banded_conv(att_int, sig_x_row, 1)
         if p.shadow_blur_mm > 0:                                                  # optional extra fill-in
@@ -482,19 +501,25 @@ class PreviewRenderer:
         # a perpendicular boundary with reflection R peaks at specular * R speckle-rms units;
         # every echo is attenuated along its own path before it is blurred by the PSF, so a
         # bright reflector in front of a sudden loss (bone, air) keeps its full peak
-        rf = speckle + (p.specular * np.sqrt(ref) / float(kz0.max())) * spec_echo / energy.sqrt()[:, None]
-        rf = rf * att_int.sqrt()
-        parts = []
-        for comp in (rf.real, rf.imag):
-            comp = _banded_conv(comp, sig_z_row / dz, 0)                          # axial, sigma per depth
-            parts.append(_banded_conv(comp, sig_x_row, 1))                        # lateral, sigma per row
-        env2 = (parts[0] ** 2 + parts[1] ** 2) * energy[:, None]                 # intensity (nz, nx)
+        att_amp = att_int.sqrt()
+        diffuse = speckle * att_amp
+        specular = (p.specular * np.sqrt(ref) / float(kz0.max())) * spec_echo / energy.sqrt()[:, None] * att_amp
+        rf = diffuse + specular
+        if p.reverberation:
+            # multiple reflections of specular echoes stay coherent across the aperture (replicas,
+            # A-lines); those of diffuse scattering are incoherent (Pinton et al. 2014) and the
+            # delay-and-sum gain over speckle, G = 2M/3 for M receive elements (Long et al. 2020),
+            # suppresses them relative to the primary speckle
+            m_rx = torch.clamp(z / p.lateral_f_number, max=width) / (spec.pitch * 1e3)
+            g_das = (2 * m_rx.clamp(min=1.0) / 3)[:, None]
+            rf = (rf + reverberation(specular, r_coh, att_int, spec.face_reflection, dz)
+                  + reverberation(diffuse, r_coh, att_int, spec.face_reflection, dz) / g_das.sqrt())
+        rf = torch.complex(_banded_conv(rf.real, sig_z_row / dz, 0), _banded_conv(rf.imag, sig_z_row / dz, 0))
+        env2 = bm.lateral(rf, z).abs() ** 2 * energy[:, None]                     # intensity (nz, nx)
 
-        # display depth: the scanner maps time to depth with c0. Bone and air interiors are
-        # anechoic and sit behind total shadows, so their extreme speeds are clamped to the
-        # soft-tissue range rather than stretching or squashing the display
-        c_c = c_c.clamp(1300.0, 1800.0)
-        z_app = torch.cumsum(C0 / c_c * dz, 0) - 0.5 * dz * C0 / c_c[:1]          # (nz, nx), monotonic
+        # display depth: the scanner maps time to depth with c0; echoes arrive late by the
+        # aperture-averaged excess delay of the transmit and receive paths (beam.BeamModel)
+        z_app = torch.cummax(z[:, None] + bm.depth_shift(z), 0).values             # (nz, nx), monotonic
         n_app = int(round(p.depth_mm / dz))
         targets = ((torch.arange(n_app, device=dev, dtype=torch.float32) + 0.5) * dz)
         zt = z_app.t().contiguous()                                               # (nx, nz)
@@ -547,6 +572,7 @@ class PreviewRenderer:
             "lesion_area_mm2": round(float(mask.sum()) * px_x * px_z, 2), "lesion_types": lesion_types,
             "mean_frequency_mhz": [round(float(fc), 2), round(float(spec.c * 1e-3 / lam_row[-1]), 2)],
             "internal_dz_mm": dz,
+            "aberration_rms_ns": round(float(bm.ab_rms_ns.median()), 1),
             "render_ms": round((time.perf_counter() - t0) * 1e3, 1),
         }
         return out, meta, lab_o.to(torch.uint8).cpu().numpy()

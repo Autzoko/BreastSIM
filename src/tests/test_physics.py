@@ -72,18 +72,23 @@ def test_specular_falls_off_with_incidence_angle():
     assert 20 * np.log10(p1 / p0) < -8          # oblique smooth boundary reflects away from the aperture
 
 
-def test_spectral_attenuation_lut_matches_gaussian_theory():
-    spec = PROBES["L12-hf"]
+def test_spectral_attenuation_lut_matches_pymust_spectrum():
+    # the pulse-echo spectrum is MUST's (one-cycle excitation x generalized normal probe response):
+    # cross-check the LUT centroids against PyMUST's own spectrum functions
+    pymust = pytest.importorskip("pymust")
+    spec = PROBES["L11-5v"]
     A, E, fbar, sf = spectral_attenuation_lut(spec, power=1.0)
-    fc = spec.fc / 1e6
-    s_amp = spec.bandwidth * fc / 2.355
-    assert E[0] == pytest.approx(1.0) and fbar[0] == pytest.approx(fc, rel=1e-3)
-    # |S|^2 exp(-4 A f) with Gaussian |S|^2 of variance s_amp^2/2: centroid fc - 2 A s_amp^2, exact for y = 1
-    i = np.searchsorted(A, 0.1)
-    assert fbar[i] == pytest.approx(fc - 2 * A[i] * s_amp ** 2, rel=0.01)
-    # energy loss is smaller than the centre-frequency estimate exp(-4 A fc)
-    assert E[i] > np.exp(-4 * A[i] * fc)
+    param = pymust.getparam("L11-5v")
+    f = np.linspace(1e-3, 2 * param.fc, 4000)
+    S = np.abs(param.getPulseSpectrumFunction()(2 * np.pi * f) * param.getProbeFunction()(2 * np.pi * f) ** 2)
+    for a in (0.0, 0.05, 0.1, 0.2):
+        P = S ** 2 * np.exp(-4 * a * (f / 1e6))
+        ref = (P * f).sum() / P.sum() / 1e6
+        assert np.interp(a, A, fbar) == pytest.approx(ref, rel=0.01)
+    assert E[0] == pytest.approx(1.0)
     assert np.all(np.diff(fbar) < 0) and np.all(np.diff(E) < 0)
+    # the probe passband bounds the downshift: 30 mm of 0.75 dB/cm/MHz tissue keeps > 60 % of fc
+    assert np.interp(0.75 * 3 / 8.686, A, fbar) > 0.6 * spec.fc / 1e6
 
 
 def test_speed_of_sound_moves_boundaries_like_a_scanner():
@@ -110,9 +115,12 @@ def test_attenuation_slope_matches_spectral_theory():
     vol = layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6, alpha=alpha)
     r, _, meta, _ = render(vol)
     inten = r.last_intensity.cpu().numpy()
+    # the same medium without attenuation carries the beam's own depth dependence (transmit focal zone)
+    r0, _, _, _ = render(layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6, alpha=0.0))
     zz = (np.arange(inten.shape[0]) + 0.5) * meta["px_z_mm"]
     sel = (zz > 5) & (zz < 35)
-    slope = np.polyfit(zz[sel], 10 * np.log10(inten.mean(1))[sel], 1)[0]
+    ratio = inten.mean(1) / r0.last_intensity.cpu().numpy().mean(1)
+    slope = np.polyfit(zz[sel], 10 * np.log10(ratio)[sel], 1)[0]
     A, E, _, _ = spectral_attenuation_lut(PROBES["L11-5v"], 1.0)
     expect = np.polyfit(zz[sel], 10 * np.log10(np.interp(alpha * zz[sel] * 1e-3, A, E)), 1)[0]
     assert slope == pytest.approx(expect, rel=0.05)
@@ -143,13 +151,17 @@ def posterior_profile(vol, **kw):
 def test_refraction_edge_shadows_at_lesion_margins():
     vol = sphere_in_fat()
     prof, cols, meta = posterior_profile(vol)
-    prof_off, _, _ = posterior_profile(vol, edge_shadow_db=0.0)
+    prof_off, _, _ = posterior_profile(vol, edge_shadow_db=0.0, aberration=False, reverberation=False)
     px = meta["px_x_mm"]
     edges = np.r_[cols.min() - int(0.5 / px):cols.min() + int(0.5 / px), cols.max() - int(0.5 / px):cols.max() + int(0.5 / px)]
-    far = np.r_[: cols.min() - int(6 / px), cols.max() + int(6 / px):]
+    # reference columns away from the sphere but also away from the array ends, where the truncated
+    # aperture lowers the focal gain
+    n = prof.shape[0]
+    far = np.r_[int(5 / px): cols.min() - int(6 / px), cols.max() + int(6 / px): n - int(5 / px)]
     # dark streaks behind the margins (same attenuation everywhere: pure refraction effect) ...
     assert prof[edges].mean() < prof[far].mean() - 1.5
-    # ... that vanish when the boundary-transmission model is off
+    # ... that vanish when the boundary-transmission model is off (with the lens-like delays of the
+    # sphere, which also defocus behind its margins, and the multiple reflections off as well)
     assert abs(prof_off[edges].mean() - prof_off[far].mean()) < 1.0
 
 
@@ -224,7 +236,45 @@ def test_chest_wall_muscle_ribs_and_rib_shadows():
     inten = 10 * np.log10(r.last_intensity.cpu().numpy() + 1e-12)
     rib_cols = np.nonzero((labels == tissue.RIB).any(0))[0]
     gap_cols = np.nonzero(~(labels == tissue.RIB).any(0))[0]
-    below_ribs = np.nonzero((labels == tissue.RIB).any(1))[0].max() + int(1 / meta["px_z_mm"])
-    deep = slice(below_ribs, below_ribs + int(4 / meta["px_z_mm"]))
-    # bone shadows: far darker behind ribs than behind the intercostal spaces (pleura is bright there)
+    rib_rows = np.nonzero((labels == tissue.RIB).any(1))[0]
+    # within the rib depth range: behind the bone surface vs intercostal muscle at the same depth
+    # (below the pleura both are dark: air passes nothing but multiple reflections)
+    deep = slice(rib_rows.min() + int(2 / meta["px_z_mm"]), rib_rows.max() - int(1 / meta["px_z_mm"]))
+    rib_cols = rib_cols[(labels[deep][:, rib_cols] == tissue.RIB).mean(0) > 0.9]
+    gap_cols = gap_cols[(labels[deep][:, gap_cols] == tissue.MUSCLE).mean(0) > 0.9]
+    # bone shadows: far darker behind the rib surface than the intercostal muscle beside it
     assert inten[deep][:, rib_cols].mean() < inten[deep][:, gap_cols].mean() - 10
+
+
+def test_transmit_focal_zone_is_brightest_and_narrowest():
+    # homogeneous speckle, no attenuation: speckle energy peaks at the transmit focus
+    vol = layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6)
+    r, _, meta, _ = render(vol, tx_focus_mm=20.0, depth_mm=40.0, reverberation=False)
+    inten = r.last_intensity.cpu().numpy()
+    zz = (np.arange(inten.shape[0]) + 0.5) * meta["px_z_mm"]
+    prof = np.convolve(10 * np.log10(inten[:, 40:-40].mean(1)), np.ones(25) / 25, mode="same")
+    sel = (zz > 5) & (zz < 37)
+    assert abs(zz[sel][np.argmax(prof[sel])] - 20.0) < 5.0
+    assert prof[sel].max() - prof[(zz > 4) & (zz < 6)].mean() > 1.0
+
+
+def test_flat_strong_reflector_reverberates_at_twice_its_depth():
+    # smooth soft-tissue / high-impedance layer at 12 mm (r ~ 0.5): probe-face replica at 24 mm
+    vol = layered(tissue.FAT, tissue.GLAND, 12.0, z_top=1.40, z_bottom=4.2)
+    r_on, _, meta, _ = render(vol, echo=False, depth_mm=30.0, aberration=False)
+    r_off, _, _, _ = render(vol, echo=False, depth_mm=30.0, aberration=False, reverberation=False)
+    zz = (np.arange(r_on.last_intensity.shape[0]) + 0.5) * meta["px_z_mm"]
+    on = 10 * np.log10(r_on.last_intensity.cpu().numpy().mean(1) + 1e-20)
+    off = 10 * np.log10(r_off.last_intensity.cpu().numpy().mean(1) + 1e-20)
+    near = (zz > 23) & (zz < 25)
+    assert on[near].max() > off[near].max() + 20
+
+
+def test_aberration_follows_speed_of_sound_heterogeneity():
+    flat = layered(tissue.GLAND, tissue.GLAND, 15.0, z_top=1.6, z_bottom=1.6)
+    _, _, m0, _ = render(flat)
+    assert m0["aberration_rms_ns"] == pytest.approx(0.0, abs=0.5)
+    # fat lobules (1440 m/s) in gland (1540 m/s): tens of ns, as measured in breast (Hinkelman 1995: 67 ns)
+    vol = sphere_in_fat()
+    _, _, m1, _ = render(vol)
+    assert m1["aberration_rms_ns"] > 2.0

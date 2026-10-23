@@ -22,6 +22,9 @@ class ProbeSpec:
     height: float        # elevation aperture, m
     elev_focus: float    # elevation lens focus, m
     c: float = 1540.0
+    # amplitude reflection of the probe face for reverberation: silicone lens 1.35 MRayl (Hosono et al.
+    # 2007) against ~1.5 MRayl tissue/gel; no measured value for a whole probe face was found
+    face_reflection: float = 0.05
 
     @property
     def aperture(self):
