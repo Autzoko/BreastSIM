@@ -63,7 +63,7 @@ def main():
     d = pd.DataFrame(res)
     d["key"] = d.dataset + ":" + d.group.astype(str)
     scal = [c for c in d.columns if c not in ("dataset", "file", "group", "key", "px_mm")
-            and np.issubdtype(d[c].dtype, np.number)]
+            and pd.api.types.is_numeric_dtype(d[c])]
     t = d.groupby("key")[scal].median().round(3)
     t.insert(0, "n", d.groupby("key").size())
     t.to_csv(out / "summary.csv")

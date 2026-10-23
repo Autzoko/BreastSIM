@@ -208,7 +208,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     d = pd.DataFrame(rows)
     d.to_csv(out / "lesions.csv", index=False)
-    num = [c for c in d.columns if np.issubdtype(d[c].dtype, np.number)]
+    num = [c for c in d.columns if pd.api.types.is_numeric_dtype(d[c])]
     t = d.groupby(["dataset", "pathology"])[num].median().round(3)
     t.insert(0, "n", d.groupby(["dataset", "pathology"]).size())
     t.to_csv(out / "summary.csv")
