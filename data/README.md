@@ -13,7 +13,7 @@ Large datasets are symlinks into the host's big-storage root
 | `nbp3d_oat64/` | [IDB-8164905](https://doi.org/10.13012/B2IDB-8164905_V1) — Park et al. 2025 | CC0 | 64 sets, 0.125 mm, 1360×1360×680. Kept: `*{h,l}_label.mat`, `*{h,l}_acou.mat`. Dropped: func/opt/phi/p0/p (optoacoustic) |
 | `real/busbra/` | [BUS-BRA, Zenodo 8231412](https://zenodo.org/records/8231412) | CC BY 4.0 | 2D real breast US + masks |
 | `real/breast_lesions_usg/` | [BrEaST-Lesions_USG, TCIA](https://www.cancerimagingarchive.net/collection/breast-lesions-usg/) | CC BY 4.0 | 2D real breast US + masks + clinical data |
-| `real/busi/` | BUSI (manual download) | CC0 | scripted download blocked by host |
+| `real/busi/` | BUSI (Al-Dhabyani et al. 2020), via [Hugging Face mirror](https://huggingface.co/datasets/gymprathap/Breast-Cancer-Ultrasound-Images-Dataset) | CC0 (mirror tagged CC BY 4.0) | 780 images + masks; official host blocks scripted downloads |
 | `real/abus_tdsc/` | [TDSC-ABUS 2023](https://tdsc-abus2023.grand-challenge.org/) | challenge terms | 3D ABUS; symlink to existing copy on lab127 |
 
 IDB-8164905 label values: 0 background, 1 fat, 2 dermis, 3 epidermis, 29 glandular,

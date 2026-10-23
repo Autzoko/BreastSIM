@@ -295,11 +295,16 @@ def fetch_real_abus_tdsc():
 
 
 def fetch_real_busi():
-    """BUSI: the official host blocks scripted downloads; place it manually."""
-    out = DATA / "real" / "busi"
-    if not out.exists() or not any(out.iterdir()):
-        log("  BUSI: manual download needed (Kaggle 'aryashah2k/breast-ultrasound-images-dataset' "
-            "or scholar.cu.edu.eg/Dataset_BUSI.zip) -> extract into data/real/busi")
+    """BUSI (780 2D breast US images with masks). The official host (scholar.cu.edu.eg) sits behind a
+    browser challenge, so the unmodified archive is taken from a Hugging Face mirror."""
+    out = dataset_dir("real/busi", big=False)
+    st = State(out)
+    if "busi_mirror" not in st:
+        z = download("https://huggingface.co/datasets/gymprathap/Breast-Cancer-Ultrasound-Images-Dataset/"
+                     "resolve/main/Breast-Cancer-Ultrasound-Images-Dataset.zip", out / "BUSI_mirror.zip")
+        unzip(z, out / "extracted")
+        z.unlink()
+        st.add("busi_mirror")
 
 
 DATASETS = {
