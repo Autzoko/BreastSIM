@@ -234,14 +234,16 @@ def _kwave_run(c, rho, alpha, power, dx, cols, delays, apod, spec, t_end, cfl=0.
 
 
 def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, margin_mm=1.5, f_number=1.5,
-                     px_mm=0.05, tx_apod="tukey", gpu=True, device=None, workers=4, log=print):
+                     px_mm=0.05, tx_apod="tukey", gpu=True, device=None, workers=4, x_windows=None, log=print):
     """Conventional focused line-by-line B-mode, as in k-Wave's example_us_bmode_linear_transducer:
     for every scan line the active sub-aperture (n_active elements centred on the line) fires a
     beam focused at focus_mm and receives; only the medium under the sub-aperture (+ margin) is
     simulated. Each line is beamformed with dynamic receive focusing (F-number, Hann apodisation).
     Two-way focusing gives the low side-lobe / clutter level of clinical scanners, which a few
     unfocused plane waves do not (shadows and cysts get filled by clutter).
-    Returns the complex image (z, lateral) on a px_mm grid over the aperture."""
+    x_windows: optional [(x0_mm, half_width_mm), ...]; only lines inside them are simulated
+    (point-spread checks), the others stay zero.
+    Returns the envelope image (z, lateral) on a px_mm grid over the aperture."""
     import torch
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dx = maps["dx"] * 1e-3
@@ -254,6 +256,11 @@ def simulate_focused(maps, spec, depth_mm, focus_mm, n_active=128, line_step=2, 
     zs = np.arange(px_mm / 2, depth_mm, px_mm) * 1e-3
     lines = np.arange(0, n_el, line_step)
     x_lines = x_el[lines] + (pitch / 2 if line_step % 2 == 0 else 0.0)
+    if x_windows:
+        keep = np.zeros(len(lines), bool)
+        for x0, hw in x_windows:
+            keep |= np.abs(x_lines * 1e3 - x0) <= hw
+        lines, x_lines = lines[keep], x_lines[keep]
     img = np.zeros((len(zs), len(lines)), np.complex64)
     mcols = int(round(margin_mm * 1e-3 / dx))
     zt = torch.from_numpy(zs).to(dev, torch.float64)
