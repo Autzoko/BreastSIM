@@ -64,8 +64,10 @@ def test_speckle_decorrelates_with_elevation_shift(renderer, synthetic_volume):
 
     def corr(dv):
         img, _, _ = renderer.render(ProbePose(u=base.u, v=base.v + dv), p)
-        x, y = ref[win][..., 0].astype(float).ravel(), img[win][..., 0].astype(float).ravel()
-        return np.corrcoef(x, y)[0, 1]
+        # speckle correlation: remove the depth trend (TGC / attenuation) shared by both frames
+        x, y = (a[win][..., 0].astype(float) for a in (ref, img))
+        x, y = (a - a.mean(1, keepdims=True) for a in (x, y))
+        return np.corrcoef(x.ravel(), y.ravel())[0, 1]
     c_small, c_large = corr(0.1), corr(4.0)
     assert c_small > 0.6 and c_large < 0.4 and c_small > c_large
 
