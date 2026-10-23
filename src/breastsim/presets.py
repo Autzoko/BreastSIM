@@ -32,7 +32,8 @@ class ScanPreset:
     tgc_db_cm_mhz: float = 0.5   # TGC slope (one way, dB/cm/MHz^y)
     gray_gamma: float = 1.0      # display gray map exponent
     tx_f_number: float = 2.0     # transmit aperture = depth / F# (focused at every depth)
-    compound_deg: tuple = ()     # spatial compounding steering angles, deg         # probe presses the skin flat
+    compound_deg: tuple = ()     # spatial compounding steering angles, deg
+    noise_db: float = -200.0     # receive noise re unit-echogenicity speckle at the face, dB         # probe presses the skin flat
     sweep_step_mm: float = 0.0   # ABUS frame spacing (data generation)
     notes: str = ""
 
@@ -45,13 +46,14 @@ PRESETS = {p.name: p for p in [
                notes="handheld, 50 mm footprint, ~500x500 px"),
     ScanPreset("busbra", "BUS-BRA-like (Logiq 5/7, 10-14 MHz)", "L12-hf", 35.0, 0.1, 0.1, -13, 50, 0.8, 2.0,
                notes="handheld; dataset images are lesion-centred crops"),
-    # speckle / PSF fitted to BrEaST speckle statistics at 0.1 mm/px (2026-10-23, 16 frames x 40 settings):
-    # receive F# 4, transmit F# 6 (effective values), smoothing 0.4 px, 3-angle compounding (+-10 deg):
-    # axial / lateral speckle 0.28 / 0.86 mm (BrEaST 0.33 / 1.03), aspect 3.1 (2.8), fine-scale
-    # energy 0.064 (0.055). Display chain then refitted to BrEaST (src/scripts/calibrate_display.py).
-    # display refit (72 frames, DR capped at 70 dB): gray-histogram W1 15.5 -> 3.6 gray levels
-    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -25.4, 70.0, 0.4, 4.0,
-               tgc_db_cm_mhz=0.76, gray_gamma=2.30, tx_f_number=6.0, compound_deg=(-10.0, 0.0, 10.0),
+    # physical beam (receive F# 2, transmit F# 3 focused at every depth, no compounding: compounding and
+    # vendor filtering belong to the post-processing stage) with receive noise at -75 dB re the
+    # near-field speckle; chosen with the realism benchmark (breastsim.realism, 2026-10-23: imaging
+    # features within the spread between BUSI / BUS-BRA / BrEaST / TDSC-ABUS). The earlier fit of
+    # effective F-numbers to whole-image speckle sizes was dropped: it widened the PSF to imitate
+    # horizontal anatomy and blurred the deep field. Display chain refitted to BrEaST with this beam.
+    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -25.4, 70.0, 0.4, 2.0,
+               tgc_db_cm_mhz=0.76, gray_gamma=2.30, tx_f_number=3.0, noise_db=-75.0,
                notes="handheld multi-vendor, native pixel size"),
     ScanPreset("tdsc_abus", "TDSC-ABUS-like (15.4 cm ABUS)", "ABUS-15", 44.4, 0.2, 0.073, -12, 50, 0.6, 2.0,
                sweep_step_mm=0.476, notes="automated sweep, 0.2 x 0.073 mm, 0.476 mm frames"),
