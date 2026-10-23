@@ -6,8 +6,10 @@
 
 One frame through every lesion of the lesion phantoms (oat64 *l, USCT A-D) at a random probe
 rotation and lateral offset, plus normal-tissue frames at random positions of the same phantoms.
-Writes img/<n>.png (gray B-mode), lesion/<n>.png (mask), label/<n>.png (tissue labels) and
-meta.jsonl (phantom, pose, px_mm, view). Deterministic for a given --seed.
+Writes img/<n>.png (gray B-mode), lesion/<n>.png (mask), label/<n>.png (tissue labels),
+raw/<n>.npy (linear echo intensity before TGC, float32, relative to the unit-speckle reference;
+display variants can be evaluated without re-rendering) and meta.jsonl (phantom, pose, px_mm,
+view). Deterministic for a given --seed.
 """
 import argparse
 import json
@@ -30,7 +32,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     out = Path(args.out)
-    for sub in ("img", "lesion", "label"):
+    for sub in ("img", "lesion", "label", "raw"):
         (out / sub).mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     p = ImagingParams.from_preset(args.preset, overlay="none", **json.loads(args.set))
@@ -56,6 +58,7 @@ def main():
                 Image.fromarray(img[..., 0]).save(out / "img" / name)
                 Image.fromarray((les * 255).astype(np.uint8)).save(out / "lesion" / name)
                 Image.fromarray(lab).save(out / "label" / name)
+                np.save(out / "raw" / name.replace(".png", ".npy"), (r.last_raw / r.last_ref).cpu().numpy().astype(np.float32))
                 meta_f.write(json.dumps(dict(file=name, phantom=pid, view=view, u=float(u), v=float(v),
                                              rotation=pose.rotation, px_mm=meta["px_z_mm"],
                                              density=pid.split("/")[1][0] if pid.startswith("oat64") else pid[-1])) + "\n")

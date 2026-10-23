@@ -54,6 +54,8 @@ class ImagingParams:
     aberration: bool = True           # speed-of-sound delays along the element paths (else ideal c0 beam)
     reverberation: bool = True        # second-order multiple reflections (probe face and interfaces)
     compound_deg: tuple = ()          # spatial compounding: steering angles (deg) of the averaged frames; () = off
+    noise_db: float = -200.0          # receive (electronic) noise power re unit-echogenicity speckle at the face, dB
+    tgc_mode: str = "slope"           # "slope": tgc_db_cm_mhz; "auto": per-image robust exponential fit (PyMUST tgc)
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
     conform: bool = True              # probe presses the skin flat
     shadow_blur_mm: float = 0.0       # extra lateral fill-in of shadows (beam averaging is always applied)
@@ -157,6 +159,18 @@ def lesion_alpha(vol):
         lut[les["id"] + 1] = les["attenuation_db_cm_mhz"] * tissue.NP_PER_M_PER_DB_PER_CM
     over = lut[vol.lesion_id]
     return np.where(np.isfinite(over), over, vol.alpha.astype(np.float32))
+
+
+def auto_tgc(env2):
+    """PyMUST tgc (MUST, Garcia): robust exponential fit of the row-mean amplitude over the middle
+    80 % of the depth, compensated relative to the first row. Returns the intensity gain (H, 1)."""
+    import pymust
+    amp = env2.sqrt().cpu().numpy().astype(np.complex128)       # amplitude as IQ: |S| per row
+    state = np.random.get_state()
+    np.random.seed(0)                                            # rlinfit subsamples at random
+    _, C = pymust.tgc(amp)
+    np.random.set_state(state)
+    return torch.from_numpy(np.asarray(C, np.float32).reshape(-1, 1) ** 2).to(env2.device)
 
 
 def display_map(env2, ref, p):
@@ -546,6 +560,13 @@ class PreviewRenderer:
                 g_das = (2 * m_rx.clamp(min=1.0) / 3)[:, None]
                 rf = (rf + reverberation(specular, r_coh, att_int, spec.face_reflection, dz)
                       + reverberation(diffuse, r_coh, att_int, spec.face_reflection, dz) / g_das.sqrt())
+            if p.noise_db > -150:
+                # receive noise: white and unattenuated at the elements, band-limited by the same
+                # beamforming / PSF as the echoes, then amplified with depth by the TGC
+                gen = torch.Generator(device=dev).manual_seed(self.seed + int(1e3 * abs(theta)) + 7)
+                sn = float(10 ** (p.noise_db / 20) / np.sqrt(2))
+                rf = rf + sn * torch.complex(torch.randn(rf.shape, generator=gen, device=dev),
+                                             torch.randn(rf.shape, generator=gen, device=dev))
             rf = torch.complex(_banded_conv(rf.real, sig_z_row / dz, 0), _banded_conv(rf.imag, sig_z_row / dz, 0))
             env2 = bm.lateral(rf, z).abs() ** 2 * energy[:, None]                     # intensity (nz, nx)
 
@@ -612,9 +633,11 @@ class PreviewRenderer:
                 amp = _conv_along(amp, _gauss_kernel(0.42 * ratio, dev), dim)
         env2 = _resize_axis(_resize_axis(amp, out_h, 0, "linear"), out_w, 1, "linear") ** 2
         lab_o = _resize_axis(_resize_axis(lab_c.float(), out_h, 0, "nearest"), out_w, 1, "nearest").long()
+        self.last_raw = env2             # linear echo intensity on the output grid, before TGC
         # TGC is a function of receive time, i.e. of displayed depth
         z_out = (torch.arange(out_h, device=dev, dtype=torch.float32) + 0.5) * (p.depth_mm / out_h)
-        env2 = env2 * self.tgc_gain(spec, vol.alpha_power, z_out, p.tgc_db_cm_mhz)[:, None]
+        env2 = env2 * (auto_tgc(env2) if p.tgc_mode == "auto" else
+                       self.tgc_gain(spec, vol.alpha_power, z_out, p.tgc_db_cm_mhz)[:, None])
         self.last_intensity = env2       # linear echo intensity before compression (validation)
         self.last_ref = ref              # intensity of a unit-echogenicity speckle at 0 dB
         img = display_map(env2, ref, p)

@@ -57,8 +57,12 @@ def main():
     rep = pd.concat(tables, ignore_index=True)
     rep.to_csv(paths.OUTPUTS / "realism" / "report.csv", index=False)
     wide = rep.pivot_table(index=["group", "feature"], columns="version", values="score_mean").round(2)
-    wide["real_medians"] = rep.drop_duplicates(["group", "feature"]).set_index(["group", "feature"]).filter(
-        like="real_median").round(2).astype(str).agg(" / ".join, axis=1)
+    med = rep.drop_duplicates(["group", "feature"]).set_index(["group", "feature"]).filter(like="real_median")
+    wide["real_medians (" + " / ".join(c.split(":")[1] for c in med.columns) + ")"] = med.apply(
+        lambda r: " / ".join("-" if pd.isna(v) else f"{v:.3g}" for v in r), axis=1)
+    sim_med = rep.pivot_table(index=["group", "feature"], columns="version", values="sim_median")
+    for v in args.versions:
+        wide[f"median:{v}"] = sim_med[v].map(lambda x: f"{x:.3g}")
     pd.set_option("display.width", 250)
     pd.set_option("display.max_rows", 200)
     print(wide.to_string())
