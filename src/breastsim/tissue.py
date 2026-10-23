@@ -77,6 +77,20 @@ DEFAULT_ACOUSTIC = {
 }
 DEFAULT_ALPHA_POWER = 1.2
 
+# VICTRE phantoms are label maps only (the IDB-8164905 and USCT phantoms are VICTRE label maps
+# with acoustic properties drawn per tissue). Their properties: mean over the 128 IDB-8164905
+# phantoms on lab127 (per-tissue spread 1-3 % in c and rho, ~10 % in alpha); muscle from
+# DEFAULT_ACOUSTIC. (c m/s, rho kg/m^3, alpha Np/m/MHz^y)
+VICTRE_ACOUSTIC = {
+    BACKGROUND: (1500.0, 1000.0, 0.03), FAT: (1446.8, 906.0, 4.37), SKIN: (1550.2, 1101.0, 19.87),
+    GLAND: (1537.1, 1037.0, 8.29), NIPPLE: (1554.4, 1111.0, 20.68), LIGAMENT: (1474.3, 1003.0, 7.98),
+    TDLU: (1532.9, 1033.0, 8.18), DUCT: (1518.4, 1012.0, 7.58), ARTERY: (1536.2, 1012.0, 4.29),
+    VEIN: (1536.7, 1012.0, 4.31), TUMOR: (1530.1, 955.0, 23.27), MUSCLE: DEFAULT_ACOUSTIC[MUSCLE],
+}
+# power-law exponent per VICTRE density class, as the IDB-8164905 / USCT phantoms of BI-RADS A-D
+VICTRE_DENSITY_BIRADS = {"fatty": "A", "scattered": "B", "hetero": "C", "dense": "D"}
+VICTRE_ALPHA_POWER = {"fatty": 1.1151, "scattered": 1.1642, "hetero": 1.2563, "dense": 1.3635}
+
 # BI-RADS posterior acoustic features, drawn per lesion (deterministic per
 # phantom and lesion) when a phantom is loaded. Frequencies from the BrEaST
 # annotations (checked 2026-10-22): malignant n=98 -> none 52 %, shadowing

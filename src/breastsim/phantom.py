@@ -80,6 +80,16 @@ def list_phantoms():
         kind = "lesion" if name.endswith("l") else "healthy"
         out.append(PhantomInfo(f"oat64/{name}", "oat64", {"label": f, "acou": acou},
                                f"OAT NBP, BI-RADS {name[0]}, {kind}"))
+    for f in sorted(paths.VICTRE.glob("*/*/p_*.raw.gz")):
+        gen = f.parent / "generation.json"
+        if not gen.exists() or not f.with_suffix("").with_suffix(".mhd").exists():
+            continue  # still being generated
+        g = json.loads(gen.read_text())
+        variant, seed = f.parent.parent.name, f.parent.name
+        extra = ", ".join(f"{k}={v}" for k, v in g.get("overrides", {}).items() if k != "imgRes")
+        out.append(PhantomInfo(f"victre/{variant}_{seed}", "victre", {"raw": f, "generation": gen},
+                               f"VICTRE {g['density']} (BI-RADS {tissue.VICTRE_DENSITY_BIRADS[g['density']]}), "
+                               f"seed {seed}{', ' + extra if extra else ''}, healthy"))
     for f in sorted((paths.DATA / "oa_breast").glob("*.h5")):
         out.append(PhantomInfo(f"oab/{f.stem}", "oab", {"phan": f}, "OA-Breast (MRI-derived), healthy"))
     return out
@@ -171,7 +181,24 @@ def _load_oab(info):
     return label, c[label] * rho[label] / 1e6, a[label], c[label], 0.2, tissue.DEFAULT_ALPHA_POWER
 
 
-LOADERS = {"usct": _load_usct, "oat64": _load_oat64, "oab": _load_oab}
+def _load_victre(info):
+    """VICTRE label map (.raw.gz + .mhd, x fastest); properties from tissue.VICTRE_ACOUSTIC."""
+    import gzip
+    raw = info.files["raw"]
+    hdr = dict(l.split(" = ", 1) for l in raw.with_suffix("").with_suffix(".mhd").read_text().strip().splitlines())
+    nx, ny, nz = map(int, hdr["DimSize"].split())
+    voxel = float(hdr["ElementSpacing"].split()[0])
+    with gzip.open(raw) as f:
+        label = np.frombuffer(f.read(), np.uint8).reshape(nz, ny, nx)
+    k = _factor(voxel)
+    label = _downsample_labels(label, k)
+    c, rho, a = (tissue.lut({l: v[i] for l, v in tissue.VICTRE_ACOUSTIC.items()},
+                            default=tissue.VICTRE_ACOUSTIC[tissue.FAT][i]) for i in range(3))
+    density = json.loads(info.files["generation"].read_text())["density"]
+    return label, c[label] * rho[label] / 1e6, a[label], c[label], voxel * k, tissue.VICTRE_ALPHA_POWER[density]
+
+
+LOADERS = {"usct": _load_usct, "oat64": _load_oat64, "oab": _load_oab, "victre": _load_victre}
 
 
 # --------------------------------------------------------------- canonical
@@ -391,7 +418,8 @@ def load(pid, log=print, chest_wall=True):
     vol = Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
                  meta["voxel_mm"], meta["alpha_power"], np.load(d / "surface.npy"),
                  np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"), np.load(d / "lesion_id.npy"))
-    return add_chest_wall(vol) if chest_wall else vol
+    # VICTRE phantoms carry their own pectoralis (label 40) at the chest wall
+    return add_chest_wall(vol) if chest_wall and meta["source"] != "victre" else vol
 
 
 def add_chest_wall(vol, depth_mm=25.0):

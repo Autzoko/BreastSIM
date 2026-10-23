@@ -15,3 +15,4 @@ NBP2D = DATA / "nbp2d_usct"            # Dataverse CUFVKE 2D_slices + IDB-564816
 OAT_NBP = DATA / "nbp3d_oat64"         # IDB-8164905: 64 sets, label + acou only
 OA_BREAST = DATA / "oa_breast"         # OA-Breast HDF5 phantoms
 REAL = DATA / "real"                   # real ultrasound datasets (BUS-BRA, BrEaST, BUSI, ABUS_TDSC)
+VICTRE = Path(os.environ.get("BREASTSIM_BIG", DATA)) / "victre"   # <variant>/<seed>/p_<seed>.raw.gz (src/scripts/victre_generate.py)
