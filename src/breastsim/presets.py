@@ -49,8 +49,9 @@ PRESETS = {p.name: p for p in [
     # receive F# 4, transmit F# 6 (effective values), smoothing 0.4 px, 3-angle compounding (+-10 deg):
     # axial / lateral speckle 0.28 / 0.86 mm (BrEaST 0.33 / 1.03), aspect 3.1 (2.8), fine-scale
     # energy 0.064 (0.055). Display chain then refitted to BrEaST (src/scripts/calibrate_display.py).
-    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -22.9, 70.0, 0.4, 4.0,
-               tgc_db_cm_mhz=0.66, gray_gamma=2.54, tx_f_number=6.0, compound_deg=(-10.0, 0.0, 10.0),
+    # display refit (72 frames, DR capped at 70 dB): gray-histogram W1 15.5 -> 3.6 gray levels
+    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -25.4, 70.0, 0.4, 4.0,
+               tgc_db_cm_mhz=0.76, gray_gamma=2.30, tx_f_number=6.0, compound_deg=(-10.0, 0.0, 10.0),
                notes="handheld multi-vendor, native pixel size"),
     ScanPreset("tdsc_abus", "TDSC-ABUS-like (15.4 cm ABUS)", "ABUS-15", 44.4, 0.2, 0.073, -12, 50, 0.6, 2.0,
                sweep_step_mm=0.476, notes="automated sweep, 0.2 x 0.073 mm, 0.476 mm frames"),
