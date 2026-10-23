@@ -10,7 +10,7 @@ FROM breastsim/victre
 
 RUN sed -i 's/^\(deb .* jammy\(-updates\)\? main restricted\)$/\1 multiverse/' /etc/apt/sources.list \
     && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        libmkl-dev libmkl-full-dev libiomp-dev \
+        libmkl-dev libmkl-full-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ARG FEBIO_TAG=v3.8
@@ -18,7 +18,7 @@ RUN git clone --depth 1 --branch ${FEBIO_TAG} https://github.com/febiosoftware/F
     && cd /opt/FEBio && mkdir -p cbuild && cd cbuild \
     && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-include limits" \
         -DUSE_MKL=ON -DMKL_INC=/usr/include/mkl -DMKL_LIB_DIR=/usr/lib/x86_64-linux-gnu \
-        -DMKL_OMP_LIB=/usr/lib/x86_64-linux-gnu/libiomp5.so \
+        -DMKL_OMP_LIB=/usr/lib/x86_64-linux-gnu/libiomp5.so `# LLVM OpenMP (libomp-dev, base image), iomp5 ABI` \
     && make -j"$(nproc)" \
     && chmod -R a+rX /opt/FEBio
 
