@@ -40,8 +40,10 @@ def main():
     pline = Pipeline(seed=args.seed, results_folder=args.out,
                      arguments_generation={**DENSITY[args.density], **overrides})
     pline.generate_phantom()
-    print(json.dumps({"seed": args.seed, "density": args.density, "overrides": overrides,
-                      "seconds": round(time.time() - t0, 1)}))
+    info = {"seed": args.seed, "density": args.density, "overrides": overrides, "seconds": round(time.time() - t0, 1)}
+    with open(f"{args.out}/{args.seed}/generation.json", "w") as f:   # read by breastsim.phantom (description)
+        json.dump(info, f, indent=1)
+    print(json.dumps(info))
 
 
 if __name__ == "__main__":
