@@ -12,6 +12,7 @@ display variants can be evaluated without re-rendering) and meta.jsonl (phantom,
 view). Deterministic for a given --seed.
 """
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 
@@ -19,7 +20,7 @@ import numpy as np
 from PIL import Image
 
 from breastsim import phantom, tissue
-from breastsim.probe import ProbePose
+from breastsim.probe import PROBES, ProbePose
 from breastsim.realtime.renderer import ImagingParams, PreviewRenderer
 
 
@@ -31,12 +32,15 @@ def main():
     ap.add_argument("--normal-per-phantom", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--every", type=int, default=1, help="use every k-th phantom (quick iterations)")
+    ap.add_argument("--probe-set", default="{}", help="probe spec overrides for experiments (JSON), e.g. bandwidth")
     args = ap.parse_args()
     out = Path(args.out)
     for sub in ("img", "lesion", "label", "raw"):
         (out / sub).mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     p = ImagingParams.from_preset(args.preset, overlay="none", **json.loads(args.set))
+    if json.loads(args.probe_set):
+        PROBES[p.probe] = dataclasses.replace(PROBES[p.probe], **json.loads(args.probe_set))
     r = PreviewRenderer()
     pids = [i.id for i in phantom.list_phantoms() if (i.source == "oat64" and i.id.endswith("l")) or i.source == "usct"]
     pids = pids[::args.every]
