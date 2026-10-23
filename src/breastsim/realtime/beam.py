@@ -64,10 +64,14 @@ class BeamModel:
     """Per-render beam: block / band grid, lateral kernels, bulk delays, aberration statistics.
 
     slow: (nz, nx) excess slowness 1/c - 1/c0 (us/mm) on the internal grid (rows dz from the
-    probe face, columns x mm); A_row: (nz,) one-way attenuation integral (Np/MHz^y) per row.
+    probe face, columns x mm); A_row: (nz,) one-way attenuation integral (Np/MHz^y) per row;
+    loss: optional (nz, nx) two-way boundary transmission loss -ln(T^2) deposited at each crossing
+    (vertical lines). It is integrated along every element path, and the apodization-weighted
+    mean transmitted amplitude of the transmit and receive apertures gives the two-way intensity
+    factor per block and band (transmission_field).
     """
 
-    def __init__(self, spec, slow, x, dz, A_row, power, p, block_mm=1.0, band_mm=1.0,
+    def __init__(self, spec, slow, x, dz, A_row, power, p, loss=None, block_mm=1.0, band_mm=1.0,
                  n_freq=7, n_path=48, half_kernel_mm=8.0):
         dev = slow.device
         self.dev, self.spec, self.x, self.dz = dev, spec, x, dz
@@ -123,6 +127,9 @@ class BeamModel:
         K = torch.zeros(nd, nb, len(xi), dtype=torch.complex64, device=dev)
         K0 = torch.zeros(nd, len(xi), dtype=torch.complex64, device=dev)
         shift = torch.zeros(nd, nb, device=dev)
+        trans = torch.ones(nd, nb, device=dev)
+        if loss is not None:   # one-way cumulative intensity loss along vertical lines
+            cum_img = torch.cumsum(loss / 2, 0)[None, None]
         ab_rms = torch.zeros(nd, nb, device=dev)
         s = (torch.arange(n_path, device=dev, dtype=torch.float32) + 0.5) / n_path
         centre = nb // 2
@@ -143,6 +150,20 @@ class BeamModel:
             mean_tx = (w_tx * tau).sum(1) / w_tx.sum(1).clamp(min=1e-9)
             shift[d] = C0_MM_US * (mean_tx + mean_rx) / 2
             ab_rms[d] = torch.sqrt((w_rx * (tau - mean_rx[:, None]) ** 2).sum(1) / w_rx.sum(1).clamp(min=1e-9))
+            if loss is not None:
+                # loss along each path: increments of the cumulative field between consecutive path depths
+                sk = torch.arange(n_path + 1, device=dev, dtype=torch.float32) / n_path
+                qx = xe_loc[..., None] + (self.block_x[:, None, None] - xe_loc[..., None]) * sk[1:]
+                gx = (qx - x0) / (x1 - x0) * 2 - 1
+                g_hi = torch.stack([gx, (z * sk[1:] / z_max * 2 - 1).expand_as(gx)], -1)
+                g_lo = torch.stack([gx, (z * sk[:-1] / z_max * 2 - 1).expand_as(gx)], -1)
+                smp = lambda gg: F.grid_sample(cum_img, gg.reshape(1, nb, -1, 2), mode="bilinear", padding_mode="border",
+                                               align_corners=True).reshape(nb, -1, n_path)
+                L = (smp(g_hi) - smp(g_lo)).clamp(min=0).sum(-1)                                         # (nb, nl)
+                amp = torch.exp(-L / 2)
+                t_tx = (w_tx * amp).sum(1) / w_tx.sum(1).clamp(min=1e-9)
+                t_rx = (w_rx * amp).sum(1) / w_rx.sum(1).clamp(min=1e-9)
+                trans[d] = (t_tx * t_rx) ** 2
             # geometry: distances element -> (x_b + xi, z), focusing laws
             dxp = xi[None, None] - u[..., None]                                                       # (nb, nl, nk)
             r = torch.sqrt(dxp ** 2 + z ** 2)
@@ -178,6 +199,7 @@ class BeamModel:
             K0[d] = h0 * torch.polar(torch.ones((), device=dev), -torch.angle(h0.sum())) / s0
         self.K, self.K0 = K, K0
         self.shift = shift                       # (nd, nb) mm, apparent minus true depth
+        self.trans = trans                       # (nd, nb) two-way boundary transmission (intensity)
         self.ab_rms_ns = ab_rms * 1e3            # (nd, nb) receive-aperture rms delay residual, ns
         self.k2sum0 = (K0.abs() ** 2).sum(-1)    # (nd,) energy of the ideal (sum-normalised) kernel
 
@@ -225,6 +247,19 @@ class BeamModel:
             Kb = Kf[d0, b] * (1 - fd)[:, None] + Kf[d0 + 1, b] * fd[:, None]
             out += Rb * Kb
         return torch.fft.ifft(out, dim=-1)[:, :nx]
+
+    def _blocks_to_columns(self, v_rows):
+        bx = self.block_x
+        pos = torch.clamp((self.x - bx[0]) / (bx[1] - bx[0]), 0, len(bx) - 1 - 1e-4)
+        b0 = pos.long()
+        fb = pos - b0
+        return v_rows[:, b0] * (1 - fb) + v_rows[:, b0 + 1] * fb
+
+    def transmission_field(self, z):
+        """Two-way boundary transmission (nz, nx) at true depths z (1 at the probe face)."""
+        t = self._blocks_to_columns(self.per_row(self.trans, z))
+        f = torch.clamp(z / float(self.band_z[0]), max=1.0)[:, None]
+        return 1 + (t - 1) * f
 
     def depth_shift(self, z):
         """Apparent minus true depth (nz, nx) at true depths z: bilinear in band and block."""

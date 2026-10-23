@@ -349,7 +349,9 @@ class PreviewRenderer:
         Attenuation is integrated per plane (one-way A = int alpha ds) and turned into
         intensity with the spectral LUT; planes are averaged in intensity with the
         elevation beam weights. Returns (echo complex (nz, nx), intensity factor
-        (nz, nx), weighted A (nz, nx), coherent specular reflection complex (nz, nx)).
+        (nz, nx), weighted A (nz, nx), coherent specular reflection complex (nz, nx),
+        attenuation-only intensity factor (nz, nx), boundary loss density (nz, nx): the two-way
+        -ln(T^2) deposited at each crossing, for the aperture-averaged transmission (beam.BeamModel).
         The last one is r times the specular lobe only, without the diffuse share: it drives
         the multiple reflections (rough bone scatters its energy away and casts clean
         shadows, the smooth pleura reverberates).
@@ -364,6 +366,8 @@ class PreviewRenderer:
         coh_im = torch.zeros(nz + 1, nx, device=dev)
         inten = torch.zeros(nz, nx, device=dev)
         a_mean = torch.zeros(nz, nx, device=dev)
+        att_only = torch.zeros(nz, nx, device=dev)
+        bloss = torch.zeros(nz, nx, device=dev)
         n = max(1, p.elevation_samples)
         ts = torch.linspace(-1.5, 1.5, n, device=dev) if n > 1 else torch.zeros(1, device=dev)
         ws = torch.exp(-0.5 * ts ** 2)
@@ -420,9 +424,13 @@ class PreviewRenderer:
                 cs, sn = torch.cos(k2 * zb), torch.sin(k2 * zb)
                 for o, comp in ((out_re, amp * cs), (out_im, amp * sn), (coh_re, coh * cs), (coh_im, coh * sn)):
                     o.index_put_((iz, ix), comp, accumulate=True)
-            inten += w * self._interp(A_lut, E_lut, A) * torch.exp(-torch.cumsum(loss, 0))
+            E = self._interp(A_lut, E_lut, A)
+            inten += w * E * torch.exp(-torch.cumsum(loss, 0))
+            att_only += w * E
+            bloss += w * loss
             a_mean += w * A
-        return torch.complex(out_re[:nz], out_im[:nz]), inten, a_mean, torch.complex(coh_re[:nz], coh_im[:nz])
+        return (torch.complex(out_re[:nz], out_im[:nz]), inten, a_mean, torch.complex(coh_re[:nz], coh_im[:nz]),
+                att_only, bloss)
 
     # ------------------------------------------------------------- render
     @torch.no_grad()
@@ -464,7 +472,7 @@ class PreviewRenderer:
 
         # attenuation, boundary transmission and echoes across the elevation beam
         k2 = 4 * np.pi / lam0                                                     # 2k at fc, rad/mm
-        spec_echo, att_int, A, r_coh = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, e_ax, e_el),
+        spec_echo, att_int, A, r_coh, att_only, bloss = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, e_ax, e_el),
                                                  dz, k2, p, spec, vol.alpha_power)
         A_lut, _, fbar_lut, sf_lut = self._att_lut(spec, vol.alpha_power)
         # per-depth spectral state, weighted by the transmitted intensity: fully shadowed
@@ -481,7 +489,11 @@ class PreviewRenderer:
         # PSF: axial width follows the local spectrum (Gaussian envelope); lateral PSF from the
         # array beam model (focusing, apodization, side lobes, aberration; beam.BeamModel)
         slow = (1 / (c_c * 1e-3) - 1 / (C0 * 1e-3)) if p.aberration else torch.zeros_like(c_c)   # us/mm
-        bm = BeamModel(spec, slow, x, dz, A_row, vol.alpha_power, p)
+        bm = BeamModel(spec, slow, x, dz, A_row, vol.alpha_power, p, loss=bloss)
+        # boundary transmission (refraction / edge shadows) averaged over the element paths of the
+        # transmit and receive apertures: shadows of structures smaller than the aperture cone fill
+        # in with depth, as behind real ligaments and lobule margins
+        att_int = att_only * bm.transmission_field(z)
         kz0 = _gauss_kernel(sig_z0 / dz, dev)
         sig_x_row = lam_row * torch.clamp(z / width, min=p.lateral_f_number) / 2.355 / dx
         k2x = bm.per_row(bm.k2sum0, z)                                            # ideal lateral kernel energy per row
