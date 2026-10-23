@@ -48,10 +48,13 @@ def real_targets(dataset, limit=None):
     return np.mean(hists, 0), np.nanmedian(np.array(profs), 0), len(hists)
 
 
-def render_frames(preset, n_oat=4, poses_oat=3, poses_usct=6, seed=0):
-    """Frames with TGC off: (intensity (H, W), tissue mask, alpha power, ref) per frame."""
+def render_frames(preset, echo=None, n_oat=4, poses_oat=3, poses_usct=6, seed=0):
+    """Frames with TGC off: (intensity (H, W), tissue mask, alpha power, ref) per frame.
+    echo: {tissue label: echogenicity} overrides (experiments; tissue.ECHOGENICITY otherwise)."""
     rng = np.random.default_rng(seed)
     r = PreviewRenderer()
+    for lab, val in (echo or {}).items():
+        r.echo_lut[lab] = val
     p = ImagingParams.from_preset(preset, overlay="none", tgc_db_cm_mhz=0.0)
     frames = []
     for cls in "ABCD":
@@ -126,26 +129,30 @@ def main():
     ap.add_argument("--dataset", default="BrEaST", choices=list(realdata.READERS))
     ap.add_argument("--no-profile", action="store_true", help="fit the histogram only (cropped datasets)")
     ap.add_argument("--rerender", action="store_true")
+    ap.add_argument("--echo", nargs="*", default=[], help="echogenicity overrides, e.g. FAT=0.18")
+    ap.add_argument("--gamma-max", type=float, default=4.0)
     args = ap.parse_args()
+    echo = {getattr(tissue, k): float(v) for k, v in (e.split("=") for e in args.echo)}
+    tag = "".join(f"_{e}" for e in args.echo)
     out = paths.OUTPUTS / "calib" / args.preset
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"[calib] real targets: {args.dataset}", flush=True)
     h_real, p_real, n_real = real_targets(args.dataset)
-    cache = out / "frames.npz"
+    cache = out / f"frames{tag}.npz"
     if cache.exists() and not args.rerender:
         z = np.load(cache, allow_pickle=True)
         frames, r = list(z["frames"]), PreviewRenderer()
     else:
         print(f"[calib] rendering frames with preset {args.preset}", flush=True)
-        frames, r = render_frames(args.preset)
+        frames, r = render_frames(args.preset, echo)
         np.savez(cache, frames=np.array(frames, dtype=object))
     sims = SimSet(frames, r, args.preset)
     use_prof = not args.no_profile
 
     def loss(theta):
         tgc, gain, dr, gamma = theta
-        if not (0 <= tgc <= 1.5 and -60 <= gain <= 20 and 20 <= dr <= 100 and 0.3 <= gamma <= 4):
+        if not (0 <= tgc <= 1.5 and -60 <= gain <= 20 and 20 <= dr <= 100 and 0.3 <= gamma <= args.gamma_max):
             return 1e6
         h, prof = sims.stats(theta)
         return w1(h, h_real) + (float(np.nanmean(np.abs(prof - p_real))) if use_prof else 0.0)
@@ -160,14 +167,14 @@ def main():
     h1, pr1 = sims.stats(theta)
     mean = lambda h: float((h * np.arange(256)).sum())
     report = dict(
-        preset=args.preset, dataset=args.dataset, n_real=n_real, n_frames=len(frames), fit_profile=use_prof,
+        preset=args.preset, dataset=args.dataset, echo=args.echo, n_real=n_real, n_frames=len(frames), fit_profile=use_prof,
         before=dict(zip(("tgc_db_cm_mhz", "gain_db", "dynamic_range_db", "gray_gamma"), map(float, theta0)),
                     loss=loss(theta0), w1=w1(h0, h_real), mean_gray=mean(h0), profile=pr0.round(1).tolist()),
         after=dict(zip(("tgc_db_cm_mhz", "gain_db", "dynamic_range_db", "gray_gamma"), map(float, theta)),
                    loss=float(best.fun), w1=w1(h1, h_real), mean_gray=mean(h1), profile=pr1.round(1).tolist()),
         real=dict(mean_gray=mean(h_real), profile=p_real.round(1).tolist()))
-    (out / f"fit_{args.dataset}.json").write_text(json.dumps(report, indent=1))
-    np.savez(out / f"hist_{args.dataset}.npz", real=h_real, before=h0, after=h1)
+    (out / f"fit_{args.dataset}{tag}.json").write_text(json.dumps(report, indent=1))
+    np.savez(out / f"hist_{args.dataset}{tag}.npz", real=h_real, before=h0, after=h1)
     print(json.dumps(report, indent=1))
 
 
