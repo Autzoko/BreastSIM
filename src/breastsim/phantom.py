@@ -87,9 +87,17 @@ def list_phantoms():
         g = json.loads(gen.read_text())
         variant, seed = f.parent.parent.name, f.parent.name
         extra = ", ".join(f"{k}={v}" for k, v in g.get("overrides", {}).items() if k != "imgRes")
+        # pcl_<seed>: the same phantom after VICTRE's lesion insertion (src/scripts/victre_insert.py)
+        les = f.with_name(f.name.replace("p_", "pcl_", 1))
+        ins = f.parent / "insertion.json"
+        if les.exists() and ins.exists() and les.with_suffix("").with_suffix(".mhd").exists():
+            i = json.loads(ins.read_text())
+            f, lesions = les, f"{i['n']} breastMass {i['kind']} lesion(s), radius {i['alpha_mm']} mm"
+        else:
+            lesions = "healthy"
         out.append(PhantomInfo(f"victre/{variant}_{seed}", "victre", {"raw": f, "generation": gen},
                                f"VICTRE {g['density']} (BI-RADS {tissue.VICTRE_DENSITY_BIRADS[g['density']]}), "
-                               f"seed {seed}{', ' + extra if extra else ''}, healthy"))
+                               f"seed {seed}{', ' + extra if extra else ''}, {lesions}"))
     for f in sorted((paths.DATA / "oa_breast").glob("*.h5")):
         out.append(PhantomInfo(f"oab/{f.stem}", "oab", {"phan": f}, "OA-Breast (MRI-derived), healthy"))
     return out
