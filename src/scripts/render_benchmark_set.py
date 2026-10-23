@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--set", default="{}", help="ImagingParams overrides (JSON)")
     ap.add_argument("--normal-per-phantom", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--every", type=int, default=1, help="use every k-th phantom (quick iterations)")
     args = ap.parse_args()
     out = Path(args.out)
     for sub in ("img", "lesion", "label", "raw"):
@@ -38,6 +39,7 @@ def main():
     p = ImagingParams.from_preset(args.preset, overlay="none", **json.loads(args.set))
     r = PreviewRenderer()
     pids = [i.id for i in phantom.list_phantoms() if (i.source == "oat64" and i.id.endswith("l")) or i.source == "usct"]
+    pids = pids[::args.every]
     n = 0
     with open(out / "meta.jsonl", "w") as meta_f:
         for pid in pids:
