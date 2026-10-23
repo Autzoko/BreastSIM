@@ -34,7 +34,12 @@ import torch.nn.functional as F
 
 C0_MM_US = 1.54
 ELEMENT_FILL = 0.9      # element width / pitch (MUST's L11-5v: 0.27 mm elements on a 0.30 mm pitch)
-FRESNEL_SIGMA_MM = 0.5  # smoothing of the slowness map for the path delays (first Fresnel zone)
+# smoothing of the slowness map for the path delays (finite-frequency travel times average the medium
+# over the Fresnel zone, ~1 mm radius at 10 MHz over 20-30 mm). 2 mm matches k-Wave point targets in a
+# real phantom slice (2026-10-23, 9 targets 12-32 mm): energy outside +-1 mm 0.16 (k-Wave 0.03; 0.5 mm
+# gave 0.4), aperture delay rms 7-73 ns (breast: 33 +- 7 ns in vivo, 67 +- 13 ns ex vivo); the bulk
+# depth shift matches k-Wave within ~0.2 mm for any value
+FRESNEL_SIGMA_MM = 2.0
 
 
 def probe_spectrum(f_mhz, spec):
@@ -105,8 +110,8 @@ class BeamModel:
         wf = wf / wf.sum(1, keepdim=True)
 
         # straight rays are valid for structures larger than the first Fresnel zone; the travel
-        # time of a finite-frequency wave averages the medium over it (sqrt(lambda L) / 2 ~ 0.5 mm
-        # at 10 MHz over 10-20 mm), so thin sheets along the beam do not act as wave guides
+        # time of a finite-frequency wave averages the medium over it, so thin sheets along the
+        # beam do not act as wave guides (FRESNEL_SIGMA_MM)
         sig = FRESNEL_SIGMA_MM
         kz = torch.exp(-0.5 * (torch.arange(-int(3 * sig / dz), int(3 * sig / dz) + 1, device=dev) * dz / sig) ** 2)
         kx = torch.exp(-0.5 * (torch.arange(-int(3 * sig / dx), int(3 * sig / dx) + 1, device=dev) * dx / sig) ** 2)
