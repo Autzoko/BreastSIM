@@ -66,8 +66,8 @@ class ImagingParams:
     def from_preset(cls, name, **overrides):
         p = PRESETS[name]
         fields = {k: getattr(p, k) for k in ("probe", "depth_mm", "px_x_mm", "px_z_mm", "gain_db",
-                                             "dynamic_range_db", "tgc_db_cm_mhz", "gray_gamma",
-                                             "speckle_reduction", "lateral_f_number", "conform")}
+                                             "dynamic_range_db", "tgc_db_cm_mhz", "gray_gamma", "tx_f_number",
+                                             "compound_deg", "speckle_reduction", "lateral_f_number", "conform")}
         return cls(**{**fields, "preset": name, **overrides})
 
 

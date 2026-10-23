@@ -30,7 +30,9 @@ class ScanPreset:
     lateral_f_number: float
     conform: bool = True
     tgc_db_cm_mhz: float = 0.5   # TGC slope (one way, dB/cm/MHz^y)
-    gray_gamma: float = 1.0      # display gray map exponent         # probe presses the skin flat
+    gray_gamma: float = 1.0      # display gray map exponent
+    tx_f_number: float = 2.0     # transmit aperture = depth / F# (focused at every depth)
+    compound_deg: tuple = ()     # spatial compounding steering angles, deg         # probe presses the skin flat
     sweep_step_mm: float = 0.0   # ABUS frame spacing (data generation)
     notes: str = ""
 
@@ -43,12 +45,13 @@ PRESETS = {p.name: p for p in [
                notes="handheld, 50 mm footprint, ~500x500 px"),
     ScanPreset("busbra", "BUS-BRA-like (Logiq 5/7, 10-14 MHz)", "L12-hf", 35.0, 0.1, 0.1, -13, 50, 0.8, 2.0,
                notes="handheld; dataset images are lesion-centred crops"),
-    # display chain fitted to BrEaST (src/scripts/calibrate_display.py, 2026-10-23, array beam model,
-    # 72 frames vs 256 images, displayed DR capped at a clinical 70 dB): gray-histogram W1 4.1 gray
-    # levels (3.2 uncapped, at DR 99 dB / gamma 4: gain, DR and gamma trade off). The remaining gap
-    # is image content (too few sparse bright sheets), not the map. TGC 0.66 is stable across fits.
-    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -22.9, 70.0, 1.0, 2.0,
-               tgc_db_cm_mhz=0.66, gray_gamma=2.54, notes="handheld multi-vendor, native pixel size"),
+    # speckle / PSF fitted to BrEaST speckle statistics at 0.1 mm/px (2026-10-23, 16 frames x 40 settings):
+    # receive F# 4, transmit F# 6 (effective values), smoothing 0.4 px, 3-angle compounding (+-10 deg):
+    # axial / lateral speckle 0.28 / 0.86 mm (BrEaST 0.33 / 1.03), aspect 3.1 (2.8), fine-scale
+    # energy 0.064 (0.055). Display chain then refitted to BrEaST (src/scripts/calibrate_display.py).
+    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -22.9, 70.0, 0.4, 4.0,
+               tgc_db_cm_mhz=0.66, gray_gamma=2.54, tx_f_number=6.0, compound_deg=(-10.0, 0.0, 10.0),
+               notes="handheld multi-vendor, native pixel size"),
     ScanPreset("tdsc_abus", "TDSC-ABUS-like (15.4 cm ABUS)", "ABUS-15", 44.4, 0.2, 0.073, -12, 50, 0.6, 2.0,
                sweep_step_mm=0.476, notes="automated sweep, 0.2 x 0.073 mm, 0.476 mm frames"),
     ScanPreset("l11_5v", "Verasonics L11-5v (PyMUST reference)", "L11-5v", 40.0, 0.1, 0.1, -12, 55, 0.0, 2.0,
