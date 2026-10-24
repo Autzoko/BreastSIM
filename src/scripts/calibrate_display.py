@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""Fit a scan preset's display chain (TGC slope, gain, dynamic range, gray gamma) to a real dataset.
+"""Fit a scan preset's display chain (TGC slope and cap, gain, dynamic range, gray gamma) to real data.
 
     python src/scripts/calibrate_display.py --preset breast --dataset BrEaST
+    python src/scripts/calibrate_display.py --preset breast --dataset BrEaST TDSC-ABUS BUSI BUS-BRA   # joint
     python src/scripts/calibrate_display.py --preset busi --dataset BUSI
     python src/scripts/calibrate_display.py --preset busbra --dataset BUS-BRA --no-profile   # lesion-centred crops
 
@@ -11,8 +12,9 @@
 2. Takes the real targets on tissue pixels (lesions dilated and excluded, as in
    breastsim.realism): the gray-level distribution (every image weighted equally) and the
    median depth profile (10 bins from the skin to the bottom of the tissue region).
-3. Minimises W1(gray histograms) + mean |depth-profile difference| (both in gray levels) over
-   (tgc_db_cm_mhz, gain_db, dynamic_range_db, gray_gamma), Nelder-Mead from a grid of starts.
+3. Minimises W1(gray histograms) + mean |depth-profile difference| (both in gray levels), averaged
+   over the datasets, over (tgc_db_cm_mhz, gain_db, dynamic_range_db, gray_gamma, tgc_max_db),
+   Nelder-Mead from a grid of starts. Lesion-centred crops (BUS-BRA) give no depth profile.
 
 The physics (attenuation, speckle, PSF) is untouched: only the scanner-side display chain is
 fitted, as a sonographer sets TGC / gain / DR / map for these datasets.
@@ -32,6 +34,7 @@ from breastsim.probe import PROBES, ProbePose
 from breastsim.realtime.renderer import ImagingParams, PreviewRenderer, _conv_along, _gauss_kernel
 
 BINS = np.arange(257) - 0.5
+NO_PROFILE = {"BUS-BRA"}          # lesion-centred crops: no skin-to-bottom depth profile
 
 
 def real_targets(dataset, limit=None):
@@ -103,9 +106,9 @@ class SimSet:
             self.items.append((db0, z, f["power"], torch.from_numpy(f["mask"]).to(r.device)))
 
     def gray(self, theta, item):
-        tgc, gain, dr, gamma = theta
+        tgc, gain, dr, gamma, cap = theta
         db0, z, power, m = item
-        g_tgc = 10 * torch.log10(self.r.tgc_gain(self.spec, power, z, tgc))
+        g_tgc = 10 * torch.log10(self.r.tgc_gain(self.spec, power, z, tgc, cap))
         lev = torch.clamp((db0 + g_tgc[:, None] + gain) / dr + 1, 0, 1) ** gamma
         return lev * 255, m
 
@@ -127,12 +130,13 @@ def w1(h1, h2):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--preset", default="breast")
-    ap.add_argument("--dataset", default="BrEaST", choices=list(realism.READERS))
+    ap.add_argument("--dataset", nargs="+", default=["BrEaST"], choices=list(realism.READERS))
     ap.add_argument("--no-profile", action="store_true", help="fit the histogram only (cropped datasets)")
     ap.add_argument("--rerender", action="store_true")
     ap.add_argument("--echo", nargs="*", default=[], help="echogenicity overrides, e.g. FAT=0.18")
     ap.add_argument("--gamma-max", type=float, default=4.0)
     ap.add_argument("--dr-max", type=float, default=100.0, help="upper bound of the displayed dynamic range, dB")
+    ap.add_argument("--cap-max", type=float, default=200.0, help="upper bound of the TGC gain cap, dB")
     args = ap.parse_args()
     echo = {getattr(tissue, k): float(v) for k, v in (e.split("=") for e in args.echo)}
     tag = "".join(f"_{e}" for e in args.echo)
@@ -140,7 +144,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"[calib] real targets: {args.dataset}", flush=True)
-    h_real, p_real, n_real = real_targets(args.dataset)
+    targets = {d: real_targets(d) for d in args.dataset}
+    name = "+".join(args.dataset)
     cache = out / f"frames{tag}.npz"
     if cache.exists() and not args.rerender:
         z = np.load(cache, allow_pickle=True)
@@ -150,33 +155,41 @@ def main():
         frames, r = render_frames(args.preset, echo)
         np.savez(cache, frames=np.array(frames, dtype=object))
     sims = SimSet(frames, r, args.preset)
-    use_prof = not args.no_profile
+    use_prof = {d: not args.no_profile and d not in NO_PROFILE for d in args.dataset}
+
+    def fit_terms(h, prof):
+        return {d: (w1(h, hr), float(np.nanmean(np.abs(prof - pr))) if use_prof[d] else 0.0)
+                for d, (hr, pr, _) in targets.items()}
 
     def loss(theta):
-        tgc, gain, dr, gamma = theta
-        if not (0 <= tgc <= 1.5 and -60 <= gain <= 20 and 20 <= dr <= args.dr_max and 0.3 <= gamma <= args.gamma_max):
+        tgc, gain, dr, gamma, cap = theta
+        if not (0 <= tgc <= 1.5 and -60 <= gain <= 20 and 20 <= dr <= args.dr_max and 0.3 <= gamma <= args.gamma_max
+                and 10 <= cap <= args.cap_max):
             return 1e6
-        h, prof = sims.stats(theta)
-        return w1(h, h_real) + (float(np.nanmean(np.abs(prof - p_real))) if use_prof else 0.0)
+        return float(np.mean([a + b for a, b in fit_terms(*sims.stats(theta)).values()]))
 
     p0 = ImagingParams.from_preset(args.preset)
-    theta0 = (p0.tgc_db_cm_mhz, p0.gain_db, p0.dynamic_range_db, p0.gray_gamma)
-    starts = sorted(itertools.product((0.2, 0.5, 0.8), (-25, -10), (45, 65), (1.0, 1.8)), key=loss)[:4]
+    theta0 = (p0.tgc_db_cm_mhz, p0.gain_db, p0.dynamic_range_db, min(p0.gray_gamma, args.gamma_max),
+              min(p0.tgc_max_db, args.cap_max))
+    starts = sorted(itertools.product((0.2, 0.5, 0.8), (-25, -10), (45, 65), (1.0, min(1.8, args.gamma_max)),
+                                      (min(40.0, args.cap_max), args.cap_max)), key=loss)[:4]
     best = min((minimize(loss, s, method="Nelder-Mead", options=dict(xatol=1e-3, fatol=1e-3, maxiter=400))
                 for s in starts), key=lambda res: res.fun)
     theta = best.x
     h0, pr0 = sims.stats(theta0)
     h1, pr1 = sims.stats(theta)
     mean = lambda h: float((h * np.arange(256)).sum())
+    keys = ("tgc_db_cm_mhz", "gain_db", "dynamic_range_db", "gray_gamma", "tgc_max_db")
     report = dict(
-        preset=args.preset, dataset=args.dataset, echo=args.echo, n_real=n_real, n_frames=len(frames), fit_profile=use_prof,
-        before=dict(zip(("tgc_db_cm_mhz", "gain_db", "dynamic_range_db", "gray_gamma"), map(float, theta0)),
-                    loss=loss(theta0), w1=w1(h0, h_real), mean_gray=mean(h0), profile=pr0.round(1).tolist()),
-        after=dict(zip(("tgc_db_cm_mhz", "gain_db", "dynamic_range_db", "gray_gamma"), map(float, theta)),
-                   loss=float(best.fun), w1=w1(h1, h_real), mean_gray=mean(h1), profile=pr1.round(1).tolist()),
-        real=dict(mean_gray=mean(h_real), profile=p_real.round(1).tolist()))
-    (out / f"fit_{args.dataset}{tag}.json").write_text(json.dumps(report, indent=1))
-    np.savez(out / f"hist_{args.dataset}{tag}.npz", real=h_real, before=h0, after=h1)
+        preset=args.preset, dataset=args.dataset, echo=args.echo, n_real={d: t[2] for d, t in targets.items()},
+        n_frames=len(frames),
+        before=dict(zip(keys, map(float, theta0)), loss=loss(theta0), terms=fit_terms(h0, pr0), mean_gray=mean(h0),
+                    profile=pr0.round(1).tolist()),
+        after=dict(zip(keys, map(float, theta)), loss=float(best.fun), terms=fit_terms(h1, pr1), mean_gray=mean(h1),
+                   profile=pr1.round(1).tolist()),
+        real={d: dict(mean_gray=mean(t[0]), profile=t[1].round(1).tolist()) for d, t in targets.items()})
+    (out / f"fit_{name}{tag}.json").write_text(json.dumps(report, indent=1))
+    np.savez(out / f"hist_{name}{tag}.npz", before=h0, after=h1, **{f"real_{d}": t[0] for d, t in targets.items()})
     print(json.dumps(report, indent=1))
 
 

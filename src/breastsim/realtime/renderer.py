@@ -56,10 +56,15 @@ class ImagingParams:
     compound_deg: tuple = ()          # spatial compounding: steering angles (deg) of the averaged frames; () = off
     noise_db: float = -200.0          # receive (electronic) noise power re unit-echogenicity speckle at the face, dB
     tgc_mode: str = "slope"           # "slope": tgc_db_cm_mhz; "auto": per-image robust exponential fit (PyMUST tgc)
+    tgc_max_db: float = 200.0         # cap of the TGC gain (scanner VGA range)
     speckle_reduction: float = 1.0    # Gaussian sigma (output px) on the log image
     conform: bool = True              # probe presses the skin flat
     shadow_blur_mm: float = 0.0       # extra lateral fill-in of shadows (beam averaging is always applied)
-    edge_shadow_db: float = 12.0      # max two-way loss per bulk boundary crossing (refraction / critical angle); 0 = off
+    # max two-way loss per soft-tissue boundary crossing (refraction / critical angle); 0 = off (bone and
+    # air still block). Off by default:
+    # against 10 k-Wave full-wave frames (kwave_v3 poses) it made the lateral shadow modulation stronger
+    # (median 4.2 vs k-Wave 2.7 dB; 3.6 without it) and less correlated with k-Wave's (r 0.72 vs 0.79).
+    edge_shadow_db: float = 0.0
     overlay: str = "contour"          # none | contour | labels
     elevation_samples: int = 5        # planes across the elevation beam (attenuation, boundaries)
     preset: str = DEFAULT_PRESET
@@ -69,7 +74,8 @@ class ImagingParams:
         p = PRESETS[name]
         fields = {k: getattr(p, k) for k in ("probe", "depth_mm", "px_x_mm", "px_z_mm", "gain_db",
                                              "dynamic_range_db", "tgc_db_cm_mhz", "gray_gamma", "tx_f_number",
-                                             "compound_deg", "noise_db", "speckle_reduction", "lateral_f_number", "conform")}
+                                             "compound_deg", "noise_db", "tgc_max_db", "speckle_reduction", "lateral_f_number",
+                                             "conform")}
         return cls(**{**fields, "preset": name, **overrides})
 
 
@@ -251,7 +257,7 @@ class PreviewRenderer:
             self._att_luts[key] = [torch.tensor(a, device=self.device, dtype=torch.float32) for a in (A, E, fbar, sf)]
         return self._att_luts[key]
 
-    def tgc_gain(self, spec, power, depth_mm, slope_db_cm_mhz):
+    def tgc_gain(self, spec, power, depth_mm, slope_db_cm_mhz, max_db=200.0):
         """Intensity gain of the TGC curve at displayed depths (tensor, mm).
 
         Compensates a medium of the given one-way power-law attenuation for this probe's
@@ -261,7 +267,7 @@ class PreviewRenderer:
         """
         A_lut, E_lut, _, _ = self._att_lut(spec, power)
         A = slope_db_cm_mhz * 100 * NP_PER_DB * depth_mm * 1e-3                   # Np / MHz^y, one way
-        return 1 / self._interp(A_lut, E_lut, A).clamp(min=1e-30)
+        return (1 / self._interp(A_lut, E_lut, A).clamp(min=1e-30)).clamp(max=10 ** (max_db / 10))
 
     @staticmethod
     def _interp(lut_x, lut_y, x):
@@ -399,9 +405,9 @@ class PreviewRenderer:
         ws = torch.exp(-0.5 * ts ** 2)
         ws = ws / ws.sum()
         theta0, h = 0.25 / p.lateral_f_number, 0.2
-        # per-crossing cap of the two-way loss (Np): bulk interfaces up to edge_shadow_db, thin sheets
-        # (ligaments, ducts, vessel walls, skin) much less - they are narrower than the beam, which
-        # mostly passes around them
+        # per-crossing cap of the two-way loss (Np) at soft-tissue interfaces: bulk up to edge_shadow_db,
+        # thin sheets (ligaments, ducts, vessel walls, skin) much less - they are narrower than the beam,
+        # which mostly passes around them. Bone / air always block.
         cap_bulk = p.edge_shadow_db / 4.343
         cap_thin = min(p.edge_shadow_db, 3.0) / 4.343
         for t, w in zip(ts, ws):
@@ -432,13 +438,12 @@ class PreviewRenderer:
                 # leaves the line of sight -> lateral edge shadows
                 bend = (theta - torch.asin(sin2.clamp(max=1.0))).abs()
                 T = torch.where(total, torch.zeros_like(rr), (1 - rr) * torch.exp(-0.5 * (bend / (2 * theta0)) ** 2))
-                if p.edge_shadow_db > 0:
-                    thin = self.thin_lut[l1] | self.thin_lut[l2]
-                    two_way = -2 * torch.log(T.clamp(min=1e-6))
-                    capped = torch.where(thin, torch.clamp(0.3 * two_way, max=cap_thin), torch.clamp(two_way, max=cap_bulk))
-                    # bone and air interfaces (|r| > 0.3) block the beam outright: no soft-tissue cap
-                    two_way = torch.where(((z2 - z1) / (z2 + z1)).abs() > 0.3, two_way.clamp(max=30.0), capped)
-                    loss.index_put_((iz + 1, ix), two_way, accumulate=True)
+                thin = self.thin_lut[l1] | self.thin_lut[l2]
+                two_way = -2 * torch.log(T.clamp(min=1e-6))
+                capped = torch.where(thin, torch.clamp(0.3 * two_way, max=cap_thin), torch.clamp(two_way, max=cap_bulk))
+                # bone and air interfaces (|r| > 0.3) block the beam outright: no soft-tissue cap
+                two_way = torch.where(((z2 - z1) / (z2 + z1)).abs() > 0.3, two_way.clamp(max=30.0), capped)
+                loss.index_put_((iz + 1, ix), two_way, accumulate=True)
                 # echo
                 r = (z2 - z1) / (z2 + z1)
                 s_diff = torch.maximum(self.rough_lut[l1], self.rough_lut[l2])      # rougher side dominates
@@ -637,7 +642,7 @@ class PreviewRenderer:
         # TGC is a function of receive time, i.e. of displayed depth
         z_out = (torch.arange(out_h, device=dev, dtype=torch.float32) + 0.5) * (p.depth_mm / out_h)
         env2 = env2 * (auto_tgc(env2) if p.tgc_mode == "auto" else
-                       self.tgc_gain(spec, vol.alpha_power, z_out, p.tgc_db_cm_mhz)[:, None])
+                       self.tgc_gain(spec, vol.alpha_power, z_out, p.tgc_db_cm_mhz, p.tgc_max_db)[:, None])
         self.last_intensity = env2       # linear echo intensity before compression (validation)
         self.last_ref = ref              # intensity of a unit-echogenicity speckle at 0 dB
         img = display_map(env2, ref, p)

@@ -149,8 +149,9 @@ def posterior_profile(vol, **kw):
 
 
 def test_refraction_edge_shadows_at_lesion_margins():
+    # optional model (off by default, see ImagingParams.edge_shadow_db)
     vol = sphere_in_fat()
-    prof, cols, meta = posterior_profile(vol)
+    prof, cols, meta = posterior_profile(vol, edge_shadow_db=12.0)
     prof_off, _, _ = posterior_profile(vol, edge_shadow_db=0.0, aberration=False, reverberation=False)
     px = meta["px_x_mm"]
     edges = np.r_[cols.min() - int(0.5 / px):cols.min() + int(0.5 / px), cols.max() - int(0.5 / px):cols.max() + int(0.5 / px)]
@@ -230,7 +231,7 @@ def test_chest_wall_muscle_ribs_and_rib_shadows():
                          np.zeros(shape[1:], bool), {}, c, np.zeros(shape, np.uint8))
     phantom.add_chest_wall(vol)
     assert vol.a0_mm == pytest.approx(-25.0) and vol.label.shape[0] == shape[0] + 125
-    r, _, meta, labels = render(vol, depth_mm=40.0, edge_shadow_db=12.0)
+    r, _, meta, labels = render(vol, depth_mm=40.0)          # bone blocks with the soft-tissue edge model off
     present = set(np.unique(labels).tolist())
     assert {tissue.MUSCLE, tissue.RIB, tissue.LUNG} <= present
     inten = 10 * np.log10(r.last_intensity.cpu().numpy() + 1e-12)

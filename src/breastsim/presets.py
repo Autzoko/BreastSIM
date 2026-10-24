@@ -33,7 +33,8 @@ class ScanPreset:
     gray_gamma: float = 1.0      # display gray map exponent
     tx_f_number: float = 2.0     # transmit aperture = depth / F# (focused at every depth)
     compound_deg: tuple = ()     # spatial compounding steering angles, deg
-    noise_db: float = -200.0     # receive noise re unit-echogenicity speckle at the face, dB         # probe presses the skin flat
+    noise_db: float = -200.0     # receive noise re unit-echogenicity speckle at the face, dB
+    tgc_max_db: float = 200.0    # cap of the TGC gain (scanner VGA range); noise is not amplified beyond it
     sweep_step_mm: float = 0.0   # ABUS frame spacing (data generation)
     notes: str = ""
 
