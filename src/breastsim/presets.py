@@ -56,9 +56,11 @@ PRESETS = {p.name: p for p in [
     # Display chain fitted jointly to BrEaST / TDSC-ABUS / BUSI / BUS-BRA (calibrate_display.py,
     # 2026-10-24) with gamma <= 1.6 and a TGC cap <= 60 dB (scanner VGA range), so the gray map cannot
     # stand in for missing content (the BrEaST-only fit drove gamma to 2.4 and amplified the receive
-    # noise of dense breasts into a bright band); edge-shadow model off. 72 frames; loss 24.3 (BrEaST-only preset 85.8).
-    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -19.5, 67.0, 0.4, 2.0,
-               tgc_db_cm_mhz=0.36, gray_gamma=1.60, tgc_max_db=60.0, tx_f_number=3.0, noise_db=-75.0,
+    # noise of dense breasts into a bright band); edge-shadow model off; attenuation exponent y = 1
+    # (tissue.IMAGING_ALPHA_POWER). 72 frames; loss 23.7 (BrEaST-only preset 85.8); no bound active:
+    # DR 48 dB, TGC 0.42 dB/cm/MHz capped at 42 dB, gamma 1.58.
+    ScanPreset("breast", "BrEaST-like (0.078 mm px, 38x42 mm)", "L12-hf", 42.0, 0.078, 0.078, -13.5, 47.7, 0.4, 2.0,
+               tgc_db_cm_mhz=0.42, gray_gamma=1.58, tgc_max_db=42.0, tx_f_number=3.0, noise_db=-75.0,
                notes="handheld multi-vendor, native pixel size"),
     ScanPreset("tdsc_abus", "TDSC-ABUS-like (15.4 cm ABUS)", "ABUS-15", 44.4, 0.2, 0.073, -12, 50, 0.6, 2.0,
                sweep_step_mm=0.476, notes="automated sweep, 0.2 x 0.073 mm, 0.476 mm frames"),
