@@ -90,6 +90,13 @@ VICTRE_ACOUSTIC = {
 # power-law exponent per VICTRE density class, as the IDB-8164905 / USCT phantoms of BI-RADS A-D
 VICTRE_DENSITY_BIRADS = {"fatty": "A", "scattered": "B", "hetero": "C", "dense": "D"}
 VICTRE_ALPHA_POWER = {"fatty": 1.1151, "scattered": 1.1642, "hetero": 1.2563, "dense": 1.3635}
+# Frequency exponent used for imaging (renderer). The phantoms' exponents (USCT / OA-Breast / VICTRE
+# classes A-D: 1.12-1.36) are one homogenised y per breast, fitted over 0.2-2.3 MHz for USCT
+# solvers that need a single global y (Li et al. 2021, Table IV); extrapolated to 7-12 MHz they
+# double the attenuation of dense breasts. With y = 1 the phantoms' per-tissue coefficients (IT'IS)
+# read 0.38 (fat) and 0.75 (gland) dB/cm/MHz, the clinical-band values, as linear simulators
+# (Field II, PyMUST) quote them.
+IMAGING_ALPHA_POWER = 1.0
 
 # BI-RADS posterior acoustic features, drawn per lesion (deterministic per
 # phantom and lesion) when a phantom is loaded. Frequencies from the BrEaST

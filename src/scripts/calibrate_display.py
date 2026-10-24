@@ -83,7 +83,7 @@ def render_frames(preset, echo=None, n_oat=4, poses_oat=3, poses_usct=6, seed=0)
                 m = (lab != tissue.BACKGROUND) & ~ndi.binary_dilation(np.isin(lab, tissue.LESIONS), iterations=15)
                 m = m & ndi.binary_erosion(np.ones_like(m), iterations=6, border_value=0)
                 if m.sum() > 4000:
-                    frames.append(dict(inten=inten, mask=m, power=vol.alpha_power, ref=r.last_ref, pid=pid, cls=cls))
+                    frames.append(dict(inten=inten, mask=m, power=tissue.IMAGING_ALPHA_POWER, ref=r.last_ref, pid=pid, cls=cls))
         print(f"  {cls}: {len(frames)} frames", flush=True)
     return frames, r
 

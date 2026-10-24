@@ -473,7 +473,7 @@ class PreviewRenderer:
         lam0 = spec.wavelength * 1e3                     # mm at fc
         width, h_el, zf = spec.aperture * 1e3, spec.height * 1e3, spec.elev_focus * 1e3
         fc = spec.fc / 1e6
-        sig_f0 = float(self._att_lut(spec, vol.alpha_power)[3][0])   # MHz, amplitude pulse-echo spectrum sigma
+        sig_f0 = float(self._att_lut(spec, tissue.IMAGING_ALPHA_POWER)[3][0])   # MHz, amplitude pulse-echo spectrum sigma
         sig_z0 = spec.c * 1e-3 / (2 * np.pi * sig_f0) / 2  # mm, two-way envelope sigma at the probe face
         dz = float(np.clip(sig_z0 / 1.5, 0.02, 0.05))     # internal axial sampling
         dx = float(np.clip(p.px_x_mm, 0.1, 0.2))          # internal lateral sampling
@@ -512,8 +512,8 @@ class PreviewRenderer:
             # attenuation, boundary transmission and echoes across the elevation beam
             k2 = 4 * np.pi / lam0                                                     # 2k at fc, rad/mm
             spec_echo, att_int, A, r_coh, att_only, bloss = self._interfaces(plane, sigma_y_lam(z, lam0)[:, None], (e_lat, d_ln, e_el),
-                                                     dz, k2, p, spec, vol.alpha_power)
-            A_lut, _, fbar_lut, sf_lut = self._att_lut(spec, vol.alpha_power)
+                                                     dz, k2, p, spec, tissue.IMAGING_ALPHA_POWER)
+            A_lut, _, fbar_lut, sf_lut = self._att_lut(spec, tissue.IMAGING_ALPHA_POWER)
             # per-depth spectral state, weighted by the transmitted intensity: fully shadowed
             # columns (behind bone or air) contribute nothing visible and must not shift it
             A_row = (A * att_int).sum(1) / att_int.sum(1).clamp(min=1e-12)
@@ -528,7 +528,7 @@ class PreviewRenderer:
             # PSF: axial width follows the local spectrum (Gaussian envelope); lateral PSF from the
             # array beam model (focusing, apodization, side lobes, aberration; beam.BeamModel)
             slow = (1 / (c_c * 1e-3) - 1 / (C0 * 1e-3)) if p.aberration else torch.zeros_like(c_c)   # us/mm
-            bm = BeamModel(spec, slow, x, dz, A_row, vol.alpha_power, p, loss=bloss)
+            bm = BeamModel(spec, slow, x, dz, A_row, tissue.IMAGING_ALPHA_POWER, p, loss=bloss)
             # boundary transmission (refraction / edge shadows) averaged over the element paths of the
             # transmit and receive apertures: shadows of structures smaller than the aperture cone fill
             # in with depth, as behind real ligaments and lobule margins
@@ -642,7 +642,7 @@ class PreviewRenderer:
         # TGC is a function of receive time, i.e. of displayed depth
         z_out = (torch.arange(out_h, device=dev, dtype=torch.float32) + 0.5) * (p.depth_mm / out_h)
         env2 = env2 * (auto_tgc(env2) if p.tgc_mode == "auto" else
-                       self.tgc_gain(spec, vol.alpha_power, z_out, p.tgc_db_cm_mhz, p.tgc_max_db)[:, None])
+                       self.tgc_gain(spec, tissue.IMAGING_ALPHA_POWER, z_out, p.tgc_db_cm_mhz, p.tgc_max_db)[:, None])
         self.last_intensity = env2       # linear echo intensity before compression (validation)
         self.last_ref = ref              # intensity of a unit-echogenicity speckle at 0 dB
         img = display_map(env2, ref, p)
