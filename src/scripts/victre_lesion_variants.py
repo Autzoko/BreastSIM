@@ -1,18 +1,19 @@
 #!/usr/bin/env python
-"""Lesion variants of VICTRE phantoms with the unmodified pipeline (victre_insert.py in breastsim/victre).
+"""Lesion variants of VICTRE phantoms with the unmodified pipeline (victre_insert_at.py in breastsim/victre).
 
     python src/scripts/victre_lesion_variants.py --bases ds_fatty/11 ds_dense/14 ... --per-base 3
 
 For each base phantom <BIG>/victre/<variant>/<seed> (never modified) and k < per-base, the base
-files are copied to <BIG>/victre/<variant>_les<k>/<seed>/ and victre_insert.py inserts n breastMass
+files are copied to <BIG>/victre/<variant>_les<k>/<seed>/ and victre_insert_at.py inserts one breastMass
 mass there (writes pcl_<seed>; phantom.list_phantoms then registers victre/<variant>_les<k>_<seed>
 with the lesions). Per variant, drawn with a fixed seed: morphology (smooth / lobulated / spiculated,
 the documented breastMass settings in victre_insert.KINDS), mean radius alpha (log-uniform
-2.5-8 mm: eq. diameters ~5-16 mm around the clinical ~10 mm) and the mass seed.
-One mass per phantom: insert_lesions tests the mass's bounding box (~2x its diameter) against skin /
-muscle / nipple / other lesions and restarts the whole insertion when one fails; with two 10 mm masses
-the second box overlapped the first at every candidate and it retried up to 1000 times. A run that
-exceeds --timeout is stopped and retried with alpha x 0.75 (up to two times).
+2.5-8 mm: eq. diameters ~5-16 mm around the clinical ~10 mm), the mass seed and the location seed
+(one of the pipeline's candidate locations, preferably 8-25 mm below the skin; see victre_insert_at.py).
+One mass per phantom: the random insertion (victre_insert.py) tests the mass's bounding box (~2x its
+diameter) and restarts the whole insertion when one of n masses fails (with two 10 mm masses it retried
+up to 1000 times), and it puts every variant of a phantom at the same place. A run that fails or
+exceeds --timeout is retried with alpha x 0.75 (up to two times).
 Docker containers run with OMP_NUM_THREADS = --cpus (breastMass / breastPhantomMain open an OpenMP
 region per sample; with the default 48 threads under a 2-CPU quota they spin and run ~50x slower).
 """
@@ -34,7 +35,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bases", nargs="+", required=True, help="<variant>/<seed> under $BREASTSIM_BIG/victre")
     ap.add_argument("--per-base", type=int, default=3)
-    ap.add_argument("--n", type=int, default=1, help="masses per phantom")
     ap.add_argument("--timeout", type=float, default=180,
                     help="s per insertion run before retrying smaller (successful runs take 10-30 s)")
     ap.add_argument("--parallel", type=int, default=3)
@@ -58,7 +58,7 @@ def main():
                     shutil.copy2(f, dst / f.name)
             shutil.copy2(src / "generation.json", dst / "generation.json")
             jobs.append(dict(name=f"{variant}_les{k}/{seed}", dst=dst, seed=seed, kind=kind, alpha=alpha, tries=0,
-                             mass_seed=int(rng.integers(1, 10_000))))
+                             mass_seed=int(rng.integers(1, 10_000)), loc_seed=int(rng.integers(1, 10_000))))
     running = []
     while jobs or running:
         while jobs and len(running) < a.parallel:
@@ -66,8 +66,9 @@ def main():
             cname = f"ds_ins_{j['name'].replace('/', '_')}"
             cmd = ["docker", "run", "--rm", "--name", cname, "--cpus", str(a.cpus), "-e", f"OMP_NUM_THREADS={a.cpus}",
                    "-u", f"{_id('-u')}:{_id('-g')}", "-v", f"{j['dst'].parent}:/out", "-v", f"{scripts}:/scripts",
-                   "breastsim/victre", "python3", "/scripts/victre_insert.py", "--out", "/out", "--seed", j["seed"],
-                   "--kind", j["kind"], "--alpha", str(j["alpha"]), "--n", str(a.n), "--mass-seed", str(j["mass_seed"])]
+                   "breastsim/victre", "python3", "/scripts/victre_insert_at.py", "--out", "/out", "--seed", j["seed"],
+                   "--kind", j["kind"], "--alpha", str(j["alpha"]), "--mass-seed", str(j["mass_seed"]),
+                   "--loc-seed", str(j["loc_seed"])]
             log = open(paths.VICTRE / f"{cname}.log", "w")
             running.append((j, cname, subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT), time.time()))
             print(f"start {j['name']}: {j['kind']} alpha {j['alpha']} mass seed {j['mass_seed']}", flush=True)

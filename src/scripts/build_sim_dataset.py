@@ -16,7 +16,8 @@ inside the field of view and onto the slice (elevation offset < 0.6 x lesion rad
 shallower placements are preferred (weight exp(-depth / depth_scale_mm)): the phantoms are pendant
 (prone) breasts, so lesions straight below the highest skin point sit deeper than in supine
 clinical scans. After rendering the frame is kept only if the rendered tissue labels contain
-lesion pixels (area >= --min-area mm2); normal frames must contain none. Frames with more than 2 %
+lesion pixels (area >= --min-area mm2, after dropping components < 1/4 of the largest: detached
+sub-resolution mass fragments); normal frames must contain none. Frames with more than 2 %
 background (probe off the breast) are redrawn.
 
 Shard file <out>/shard_<k>.h5: img (N, H, W) uint8, mask (N, H, W) uint8 (lesion = 1),
@@ -127,6 +128,19 @@ def normal_pose(vol, rng):
                      rock=float(rng.uniform(-12, 12)))
 
 
+def clean_mask(les):
+    """Segmentation target: the largest lesion component and any other of >= 1/4 of its area (the rule of
+    breastsim.realism). Drops sub-resolution mass fragments (breastMass leaves detached voxels around some
+    masses; invisible in the image, they would be label noise). The raw tissue labels are stored as well."""
+    from scipy import ndimage
+    lab, n = ndimage.label(les)
+    if n <= 1:
+        return les
+    area = np.bincount(lab.ravel())[1:]
+    keep = np.nonzero(area >= area.max() / 4)[0] + 1
+    return np.isin(lab, keep)
+
+
 def frame_stats(img, les, px):
     """Lesion size / shape / depth and gray levels (for dataset statistics)."""
     out = dict(lesion_area_mm2=round(float(les.sum()) * px * px, 2), gray_mean=round(float(img.mean()), 1))
@@ -175,7 +189,7 @@ def cmd_render(a):
             if pose is None:
                 continue
             img, meta, lab = r.render(pose, p)
-            img, les = img[..., 0], np.isin(lab, tissue.LESIONS)
+            img, les = img[..., 0], clean_mask(np.isin(lab, tissue.LESIONS))
             area = les.sum() * meta["px_x_mm"] * meta["px_z_mm"]
             ok = (lab == tissue.BACKGROUND).mean() <= 0.02 and (
                 area >= plan["min_area_mm2"] if f["view"] == "lesion" else area == 0)
