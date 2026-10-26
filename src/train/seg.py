@@ -30,6 +30,12 @@ import torch.nn.functional as F
 S = 256
 
 
+def amp(dev):
+    """bf16 autocast on GPUs with native bf16 (compute capability >= 8: A100 / H100); fp32 otherwise (V100)."""
+    on = dev.type == "cuda" and torch.cuda.get_device_capability(dev)[0] >= 8
+    return torch.autocast("cuda", dtype=torch.bfloat16, enabled=on)
+
+
 # ------------------------------------------------------------------ data
 def zscore(x):
     m = x.mean((-1, -2), keepdim=True)
@@ -113,7 +119,7 @@ def predict(model, img, dev, bs=64):
     out = []
     for i in range(0, len(img), bs):
         x = zscore(torch.from_numpy(img[i:i + bs]).to(dev).float()[:, None] / 255)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+        with amp(dev):
             lo = model(x) + model(x.flip(-1)).flip(-1)        # flip test-time augmentation
         out.append((lo.float() > 0).cpu().numpy()[:, 0])
     model.train()
@@ -150,7 +156,7 @@ def train(model, x, y, out, iters, dev, lr=5e-4, bs=16, seed=0, log_every=500, e
     for it in range(start, iters):
         idx = torch.randint(0, x.shape[0], (bs,), device=dev, generator=g)
         xb, yb = augment(x[idx], y[idx], g, zoom)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+        with amp(dev):
             lo = model(xb)
         loss = loss_fn(lo.float(), yb)
         opt.zero_grad(set_to_none=True)
