@@ -12,7 +12,7 @@ physical units are computed only when the pixel size is known (`SCALED`); textur
 the image resampled to 0.1 mm/px.
 
 Feature groups, chosen for segmentation / detection / classification:
-- image: gray-level distribution, depth trend, noise floor, texture spectrum and orientation,
+- image: gray-level distribution, local mean echogenicity at the mm scale (tissue interleaving), depth trend, noise floor, texture spectrum and orientation,
   speckle size and contrast in structure-free patches (by depth third), column banding;
 - anatomy: depth layering (bright / dark band transitions and thickness, lateral continuity),
   thin bright ridges (fascia, ligaments: density, length, orientation), hypoechoic distractors
@@ -45,7 +45,8 @@ ABUS_SPACING = (0.476, 0.073, 0.2)                # TDSC-ABUS 2023 (sweep, depth
 CONTENT = {"tex_aniso", "tex_coherence", "tex_horiz_frac", "tex_mottling", "tex_psd_mid", "banding",
            "layer_transitions_per_cm", "layer_thickness_mm", "layer_continuity", "ridge_density", "ridge_length_mm",
            "ridge_horiz_frac", "distractors_per_cm2", "eqdiam_mm", "depth_mm", "h_over_w", "angle_deg", "solidity",
-           "circularity", "irregularity", "rel_area", "halo_sd"}
+           "circularity", "irregularity", "rel_area", "halo_sd", "lm_std_05", "lm_frac_05", "lm_std_15", "lm_frac_15",
+           "lm_p90p10_15"}
 SCALED = {"tex_psd_high", "tex_psd_mid", "tex_slope", "tex_aniso", "tex_horiz_frac", "tex_coherence", "tex_mottling",
           "spk_axial_mm_top", "spk_axial_mm_mid", "spk_axial_mm_deep", "spk_lateral_mm_top", "spk_lateral_mm_mid",
           "spk_lateral_mm_deep", "banding", "layer_transitions_per_cm", "layer_thickness_mm", "layer_continuity",
@@ -226,6 +227,20 @@ def image_features(g, m, scaled):
                depth_trend=np.polyfit(np.linspace(0, 1, 10), np.nan_to_num(prof, nan=np.nanmean(prof)), 1)[0])
     dark = v[v <= np.percentile(v, 5)]
     out["noise_floor_cv"] = dark.std() / max(dark.mean(), 1.0)
+    # local mean echogenicity at the mm scale (interleaving of tissues): gray level averaged over the
+    # speckle with a masked Gaussian of sigma 0.5 / 1.5 mm (px assumed 0.1 mm when the pixel size is
+    # unknown: BUSI / BUS-BRA are ~0.08-0.12 mm/px); spread as gray-level std, as a share of the
+    # pixel std, and the 10-90 % range
+    mf = m.astype(np.float32)
+    for name, s in (("05", 5), ("15", 15)):
+        den = ndi.gaussian_filter(mf, s)
+        sel = m & (den > 0.9)
+        if sel.sum() > 500:
+            lm = (ndi.gaussian_filter(g * mf, s) / np.maximum(den, 1e-6))[sel]
+            out[f"lm_std_{name}"] = lm.std()
+            out[f"lm_frac_{name}"] = lm.std() / max(v.std(), 1e-6)
+            if name == "15":
+                out["lm_p90p10_15"] = np.percentile(lm, 90) - np.percentile(lm, 10)
     if not scaled:
         return out
     # texture: tile spectra, orientation, mottling

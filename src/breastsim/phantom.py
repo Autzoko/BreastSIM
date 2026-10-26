@@ -14,6 +14,7 @@ $BREASTSIM_BIG/cache/preview/<id>/ as .npy files.
 import contextlib
 import fcntl
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,7 @@ from . import paths, tissue
 
 PREVIEW_VOXEL_MM = 0.2
 CACHE_VERSION = 4   # bump to rebuild caches after changing the conversion
+VICTRE_CONTENT_VERSION = 1   # VICTRE-only conversion (fascia band, echogenicity mixture): rebuilds VICTRE caches only
 WATER_Z, WATER_ALPHA, WATER_C = 1.5, 0.025, 1500.0
 
 # Li et al. 2021, power-law exponent per BI-RADS type.
@@ -54,6 +56,9 @@ class Volume:
     c: np.ndarray = None              # speed of sound, m/s (float16)
     lesion_id: np.ndarray = None      # uint8, lesion index + 1 inside lesions, 0 elsewhere
     a0_mm: float = 0.0                # A coordinate of voxel index 0 (negative once a chest wall is added)
+    # backscatter amplitude factor on top of tissue.ECHOGENICITY[label] (float16; None = 1): sub-voxel
+    # tissue mixture of the source phantom (see _echo_mix)
+    echo_mod: np.ndarray = None
 
     @property
     def extent_mm(self):
@@ -189,8 +194,42 @@ def _load_oab(info):
     return label, c[label] * rho[label] / 1e6, a[label], c[label], 0.2, tissue.DEFAULT_ALPHA_POWER
 
 
+def _echo_mix(src, preview, k):
+    """Backscatter amplitude factor of each preview voxel: rms echogenicity of the k^3 source voxels it
+    covers (scattered intensities of the tissues add by volume fraction) over the echogenicity of its
+    preview label. Keeps sub-voxel interleaving of fat / gland / ligament when the source is finer than
+    the preview grid. Lesion voxels (exact masks) and anechoic labels keep factor 1."""
+    e2_lut = tissue.lut(tissue.ECHOGENICITY) ** 2
+    s = [n // k * k for n in src.shape]
+    e2 = np.empty(preview.shape, np.float32)
+    step = 16 * k
+    for i in range(0, s[0], step):                     # chunks along the first axis (memory)
+        blk = e2_lut[src[i:min(i + step, s[0]), :s[1], :s[2]]]
+        e2[i // k:i // k + blk.shape[0] // k] = blk.reshape(blk.shape[0] // k, k, s[1] // k, k, s[2] // k, k).mean(axis=(1, 3, 5))
+    base = np.sqrt(e2_lut[preview])
+    keep = (base > 0) & ~np.isin(preview, tissue.LESIONS)
+    return np.where(keep, np.sqrt(e2) / np.where(keep, base, 1.0), 1.0).astype(np.float16)
+
+
+# pectoral fascia between the breast and the VICTRE muscle layer: 0.4 mm, as in add_chest_wall. The
+# generator's fat/muscle boundary is a smooth analytic surface with no fascia, which renders as a single
+# perfectly coherent mirror line; the fascia band is echogenic connective tissue (tissue.FASCIA)
+VICTRE_FASCIA_MM = float(os.environ.get("BREASTSIM_VICTRE_FASCIA_MM", 0.4))   # env: experiments (0 = off)
+
+
+def _add_fascia(label, voxel, thick_mm=VICTRE_FASCIA_MM):
+    from scipy import ndimage
+    if thick_mm <= 0:
+        return label
+    breast = (label > 0) & (label != tissue.MUSCLE)
+    near = ndimage.binary_dilation(breast, iterations=max(1, int(round(thick_mm / voxel))))
+    label[(label == tissue.MUSCLE) & near] = tissue.FASCIA
+    return label
+
+
 def _load_victre(info):
-    """VICTRE label map (.raw.gz + .mhd, x fastest); properties from tissue.VICTRE_ACOUSTIC."""
+    """VICTRE label map (.raw.gz + .mhd, x fastest); properties from tissue.VICTRE_ACOUSTIC.
+    Returns, besides the usual fields, the echogenicity mixture factor (None at preview resolution)."""
     import gzip
     raw = info.files["raw"]
     hdr = dict(l.split(" = ", 1) for l in raw.with_suffix("").with_suffix(".mhd").read_text().strip().splitlines())
@@ -199,11 +238,16 @@ def _load_victre(info):
     with gzip.open(raw) as f:
         label = np.frombuffer(f.read(), np.uint8).reshape(nz, ny, nx)
     k = _factor(voxel)
-    label = _downsample_labels(label, k)
+    src, label = label, _downsample_labels(label, k)
+    mod = _echo_mix(src, label, k) if k > 1 else None
+    del src
+    label = _add_fascia(label, voxel * k)
+    if mod is not None:
+        mod[label == tissue.FASCIA] = 1.0
     c, rho, a = (tissue.lut({l: v[i] for l, v in tissue.VICTRE_ACOUSTIC.items()},
                             default=tissue.VICTRE_ACOUSTIC[tissue.FAT][i]) for i in range(3))
     density = json.loads(info.files["generation"].read_text())["density"]
-    return label, c[label] * rho[label] / 1e6, a[label], c[label], voxel * k, tissue.VICTRE_ALPHA_POWER[density]
+    return label, c[label] * rho[label] / 1e6, a[label], c[label], voxel * k, tissue.VICTRE_ALPHA_POWER[density], mod
 
 
 LOADERS = {"usct": _load_usct, "oat64": _load_oat64, "oab": _load_oab, "victre": _load_victre}
@@ -230,13 +274,14 @@ def _orient(label):
     return order, flip
 
 
-def canonicalize(label, z, alpha, c=None, margin=4):
+def canonicalize(label, z, alpha, c=None, margin=4, extra=()):
     """Reorder to (A, U, V) with the chest wall at A=0, crop, pad with water.
 
-    Returns (label, z, alpha, ori), or (label, z, alpha, c, ori) when c is given.
+    Returns (label, z, alpha, ori), or (label, z, alpha, c, ori) when c is given; `extra` (array, fill)
+    pairs are transformed the same way and returned before ori.
     """
     order, flip = _orient(label)
-    fields = [(label, 0), (z, WATER_Z), (alpha, WATER_ALPHA)] + ([(c, WATER_C)] if c is not None else [])
+    fields = [(label, 0), (z, WATER_Z), (alpha, WATER_ALPHA)] + ([(c, WATER_C)] if c is not None else []) + list(extra)
     arrs = [np.transpose(a, order) for a, _ in fields]
     if flip:
         arrs = [a[::-1] for a in arrs]
@@ -351,9 +396,13 @@ def build_cache(pid, log=print):
     info = get_info(pid)
     t0 = time.time()
     log(f"[phantom] {pid}: [1/4] reading source files ({info.source})")
-    label, z, alpha, c, voxel, power = LOADERS[info.source](info)
+    label, z, alpha, c, voxel, power, *rest = LOADERS[info.source](info)
+    mod = rest[0] if rest else None
     log(f"[phantom] {pid}: [2/4] reorienting and writing preview volume")
-    label, z, alpha, c, ori = canonicalize(label, z, alpha, c)
+    if mod is not None:
+        label, z, alpha, c, mod, ori = canonicalize(label, z, alpha, c, extra=[(mod, 1.0)])
+    else:
+        label, z, alpha, c, ori = canonicalize(label, z, alpha, c)
     log(f"[phantom] {pid}: [3/4] finding lesions")
     lesions, lesion_id = find_lesions(label, voxel, return_ids=True)
     out = cache_dir(pid)
@@ -364,6 +413,8 @@ def build_cache(pid, log=print):
     np.save(out / "alpha.npy", alpha.astype(np.float16))
     np.save(out / "c.npy", c.astype(np.float16))
     np.save(out / "lesion_id.npy", lesion_id)
+    if mod is not None:
+        np.save(out / "echo_mod.npy", mod)
     np.save(out / "surface.npy", _surface(label, voxel))
     np.save(out / "lesion_proj.npy", np.isin(label, tissue.LESIONS).any(axis=0))
     log(f"[phantom] {pid}: [4/4] building 3D surfaces")
@@ -379,6 +430,7 @@ def build_cache(pid, log=print):
             "mean_c": {int(l): float(c[label == l].mean()) for l in labels},
             "lesions": lesions, "meshes": {k: [len(v[0]), len(v[1])] for k, v in meshes.items()},
             "angiogenesis": "ignored", "vessels": "kept",
+            **({"victre_content": VICTRE_CONTENT_VERSION} if info.source == "victre" else {}),
             "built": time.strftime("%Y-%m-%d %H:%M:%S"), "build_seconds": round(time.time() - t0, 1)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     log(f"[phantom] {pid}: shape {label.shape} @ {voxel} mm, {len(lesions)} lesion(s), "
@@ -393,7 +445,8 @@ def is_cached(pid):
     m = json.loads(f.read_text())
     # oat64 caches built while label_pa was merged into the labels must be rebuilt
     # oat64 caches built while label_pa was merged, or before vessels were kept, must be rebuilt
-    return m.get("version") == CACHE_VERSION and (m.get("source") != "oat64" or m.get("vessels") == "kept")
+    return (m.get("version") == CACHE_VERSION and (m.get("source") != "oat64" or m.get("vessels") == "kept")
+            and (m.get("source") != "victre" or m.get("victre_content") == VICTRE_CONTENT_VERSION))
 
 
 @contextlib.contextmanager
@@ -425,7 +478,8 @@ def load(pid, log=print, chest_wall=True):
     lesion_acoustics(pid, meta["lesions"])
     vol = Volume(pid, np.load(d / "label.npy"), np.load(d / "z.npy"), np.load(d / "alpha.npy"),
                  meta["voxel_mm"], meta["alpha_power"], np.load(d / "surface.npy"),
-                 np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"), np.load(d / "lesion_id.npy"))
+                 np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"), np.load(d / "lesion_id.npy"),
+                 echo_mod=np.load(d / "echo_mod.npy") if (d / "echo_mod.npy").exists() else None)
     # VICTRE phantoms carry their own pectoralis (label 40) at the chest wall
     return add_chest_wall(vol) if chest_wall and meta["source"] != "victre" else vol
 

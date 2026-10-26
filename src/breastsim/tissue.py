@@ -86,6 +86,7 @@ VICTRE_ACOUSTIC = {
     GLAND: (1537.1, 1037.0, 8.29), NIPPLE: (1554.4, 1111.0, 20.68), LIGAMENT: (1474.3, 1003.0, 7.98),
     TDLU: (1532.9, 1033.0, 8.18), DUCT: (1518.4, 1012.0, 7.58), ARTERY: (1536.2, 1012.0, 4.29),
     VEIN: (1536.7, 1012.0, 4.31), TUMOR: (1530.1, 955.0, 23.27), MUSCLE: DEFAULT_ACOUSTIC[MUSCLE],
+    FASCIA: DEFAULT_ACOUSTIC[FASCIA],
 }
 # power-law exponent per VICTRE density class, as the IDB-8164905 / USCT phantoms of BI-RADS A-D
 VICTRE_DENSITY_BIRADS = {"fatty": "A", "scattered": "B", "hetero": "C", "dense": "D"}

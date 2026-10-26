@@ -212,7 +212,7 @@ class PreviewRenderer:
     # ------------------------------------------------------------- volume
     def set_volume(self, vol):
         self.vol = None
-        self._labels = self._props = self._zsmooth = None
+        self._labels = self._props = self._zsmooth = self._echo_mod = None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(self.device, torch.float32)
@@ -230,6 +230,8 @@ class PreviewRenderer:
         self.c_lut = torch.from_numpy(clut).to(self.device)
         alpha = lesion_alpha(vol)
         self._labels = t(lab)[None, None]
+        # backscatter amplitude factor per voxel (sub-voxel tissue mixture), on top of echo_lut[label]
+        self._echo_mod = t(vol.echo_mod)[None, None] if vol.echo_mod is not None else None
         self._props = torch.stack([t(alpha), t(c)])[None]                     # (1, 2, A, U, V)
         # smoothed tissue-impedance field: boundary normals for the angle dependence
         zs = self.z_lut[self._labels[0, 0].long()]
@@ -348,6 +350,8 @@ class PreviewRenderer:
             col, zd, amp, pos, yv = col[ok], zd[ok], amp[ok], pos[ok], (rel @ e_el)[ok]
             w = torch.exp(-0.5 * (yv / sigma_y(zd)) ** 2)
             echo = self.echo_lut[self._sample(self._labels, pos, "nearest")[0].long()]
+            if self._echo_mod is not None:
+                echo = echo * self._sample(self._echo_mod, pos, "nearest")[0]
             val = w * echo * amp
             rf = zd / dz - 0.5                                              # fractional row (centres at (i+0.5) dz)
             r0 = torch.floor(rf).clamp(min=-1).long()
