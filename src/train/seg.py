@@ -146,7 +146,7 @@ def train(model, x, y, out, iters, dev, lr=5e-4, bs=16, seed=0, log_every=500, e
         g.set_state(st["gen"].cpu())
         start, log = st["it"], st["log"]
         print(f"resumed at {start}", flush=True)
-    t0, run = time.time(), 0.0
+    t0, run, nrun = time.time(), 0.0, 0
     for it in range(start, iters):
         idx = torch.randint(0, x.shape[0], (bs,), device=dev, generator=g)
         xb, yb = augment(x[idx], y[idx], g, zoom)
@@ -157,14 +157,14 @@ def train(model, x, y, out, iters, dev, lr=5e-4, bs=16, seed=0, log_every=500, e
         loss.backward()
         opt.step()
         sched.step()
-        run += loss.item()
+        run, nrun = run + loss.item(), nrun + 1
         if (it + 1) % log_every == 0 or it + 1 == iters:
-            rec = dict(it=it + 1, loss=round(run / log_every, 4), s=round(time.time() - t0, 1))
+            rec = dict(it=it + 1, loss=round(run / nrun, 4), s=round(time.time() - t0, 1))
             if evalf is not None:
                 rec.update(evalf(model))
             log.append(rec)
             print(json.dumps(rec), flush=True)
-            run = 0.0
+            run, nrun = 0.0, 0
             torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
                             gen=g.get_state(), it=it + 1, log=log), ck)
     torch.save(model.state_dict(), out / "model.pt")
@@ -197,7 +197,7 @@ def real_evaluator(paths, dev):
 
 
 def cmd_pretrain(a):
-    dev = torch.device("cuda")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     (ti, tm), (vi, vm), val_ph = load_sim(a.data)
     x, y = to_gpu(ti, tm, dev)
     print(f"sim train {len(ti)} / val {len(vi)} frames (val phantoms {val_ph})", flush=True)
@@ -212,7 +212,7 @@ def cmd_pretrain(a):
 
 
 def cmd_finetune(a):
-    dev = torch.device("cuda")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ti, tm, sel = load_real(a.real, "train", a.n_train, a.seed)
     x, y = to_gpu(ti, tm, dev)
     model = make_model(a.init)
@@ -232,7 +232,7 @@ def cmd_finetune(a):
 
 
 def cmd_evaluate(a):
-    dev = torch.device("cuda")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = make_model("none")
     model.load_state_dict(torch.load(a.model, map_location="cpu"))
     model.to(dev)
