@@ -69,7 +69,7 @@ def to_gpu(img, mask, dev):
     return x, y
 
 
-def augment(x, y, g, zoom=(0.75, 1.25)):
+def augment(x, y, g, zoom=(0.75, 1.25), aspect=(1.0, 1.0)):
     n, dev = x.shape[0], x.device
     ang = (torch.rand(n, device=dev, generator=g) * 2 - 1) * math.radians(15)
     lz = torch.log(torch.tensor(zoom, device=dev))
@@ -79,6 +79,8 @@ def augment(x, y, g, zoom=(0.75, 1.25)):
     th = torch.zeros(n, 2, 3, device=dev)
     th[:, 0, 0], th[:, 0, 1] = torch.cos(ang) / sc * flip, -torch.sin(ang) / sc
     th[:, 1, 0], th[:, 1, 1] = torch.sin(ang) / sc * flip, torch.cos(ang) / sc
+    th[:, 1, :2] *= torch.exp(torch.log(torch.tensor(aspect, device=dev))[0] + torch.rand(n, 1, device=dev, generator=g)
+                              * float(np.log(aspect[1] / aspect[0])))   # > 1 squeezes vertically
     th[:, :, 2] = t
     grid = F.affine_grid(th, x.shape, align_corners=False)
     x = F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
@@ -137,7 +139,8 @@ def metrics(pred, mask):
                 dice_median=round(float(np.median(dice)), 4), empty_pred=round(float((ps == 0).mean()), 4), n=len(m))
 
 
-def train(model, x, y, out, iters, dev, lr=5e-4, bs=16, seed=0, log_every=500, evalf=None, zoom=(0.75, 1.25)):
+def train(model, x, y, out, iters, dev, lr=5e-4, bs=16, seed=0, log_every=500, evalf=None, zoom=(0.75, 1.25),
+          aspect=(1.0, 1.0)):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     model.to(dev).train()
@@ -155,7 +158,7 @@ def train(model, x, y, out, iters, dev, lr=5e-4, bs=16, seed=0, log_every=500, e
     t0, run, nrun = time.time(), 0.0, 0
     for it in range(start, iters):
         idx = torch.randint(0, x.shape[0], (bs,), device=dev, generator=g)
-        xb, yb = augment(x[idx], y[idx], g, zoom)
+        xb, yb = augment(x[idx], y[idx], g, zoom, aspect)
         with amp(dev):
             lo = model(xb)
         loss = loss_fn(lo.float(), yb)
@@ -213,7 +216,8 @@ def cmd_pretrain(a):
         r = {"sim_val": metrics(predict(model, vi, dev), vm)["dice"]}
         return {**r, **(ev_real(model) if ev_real else {})}     # monitoring only, never used for selection
     model = make_model(a.init)
-    log = train(model, x, y, a.out, a.iters, dev, seed=a.seed, log_every=1000, evalf=evalf, zoom=tuple(a.zoom))
+    log = train(model, x, y, a.out, a.iters, dev, seed=a.seed, log_every=1000, evalf=evalf, zoom=tuple(a.zoom),
+                aspect=tuple(a.aspect))
     (Path(a.out) / "train.json").write_text(json.dumps(dict(args=vars(a), val_phantoms=val_ph, log=log)))
 
 
@@ -286,6 +290,9 @@ def main():
     p.add_argument("--zoom", type=float, nargs=2, default=(0.8, 2.0),
                    help="scale range of the augmentation (log-uniform, > 1 zooms in): simulated lesions are smaller "
                         "relative to the frame than in the real sets")
+    p.add_argument("--aspect", type=float, nargs=2, default=(1.0, 1.4),
+                   help="vertical squeeze range (log-uniform): simulated lesions come out taller than wide (pendant "
+                        "phantoms, per-line skin conform shears them; no probe compression), real ones wider")
     p.add_argument("--out", required=True)
     f = sub.add_parser("finetune")
     f.add_argument("--real", required=True)
