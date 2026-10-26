@@ -21,7 +21,9 @@ FEAT = paths.OUTPUTS / "realism" / "features"
 
 
 def load(name):
-    return tuple(pd.read_csv(FEAT / f"{name}_{k}.csv") for k in ("images", "lesions"))
+    def read(f):   # a healthy-phantom set has an empty lesion table
+        return pd.read_csv(f) if f.stat().st_size > 1 else pd.DataFrame()
+    return tuple(read(FEAT / f"{name}_{k}.csv") for k in ("images", "lesions"))
 
 
 def main():

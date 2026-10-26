@@ -29,13 +29,18 @@ def main():
     ap.add_argument("--voxel", type=float, default=0.2, help="imgRes in mm (VICTRE default 0.05)")
     ap.add_argument("--out", default="/out")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
-                    help="extra arguments_generation overrides (JSON values), e.g. --set doPtosis=false")
+                    help="extra arguments_generation overrides (JSON values), e.g. --set surface_a3=0.9 --set surface_doPtosis=false")
     args = ap.parse_args()
 
     overrides = {"imgRes": args.voxel}
     for kv in args.set:
         k, v = kv.split("=", 1)
-        overrides[k] = json.loads(v)
+        # keys are the pipeline's template names (surface_a3, surface_doPtosis, ligament_thickness, ...);
+        # string.Template silently ignores unknown keys, so a misspelt key would be a no-op
+        if k not in DENSITY[args.density]:
+            ap.error(f"unknown generation parameter {k!r} (keys of Victre.Constants.VICTRE_*, e.g. surface_a3)")
+        # booleans stay the pipeline's "true" / "false" strings
+        overrides[k] = v if v in ("true", "false") else json.loads(v)
     t0 = time.time()
     pline = Pipeline(seed=args.seed, results_folder=args.out,
                      arguments_generation={**DENSITY[args.density], **overrides})

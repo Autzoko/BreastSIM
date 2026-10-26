@@ -13,6 +13,7 @@ view). Deterministic for a given --seed.
 """
 import argparse
 import dataclasses
+import fnmatch
 import json
 from pathlib import Path
 
@@ -33,6 +34,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--every", type=int, default=1, help="use every k-th phantom (quick iterations)")
     ap.add_argument("--probe-set", default="{}", help="probe spec overrides for experiments (JSON), e.g. bandwidth")
+    ap.add_argument("--on-breast", type=float, default=0.0, metavar="MM",
+                    help="normal views only where breast tissue (not just chest-wall muscle) extends at least MM "
+                         "around the probe centre, e.g. 19 = half the L12-hf aperture (probe kept on the breast)")
+    ap.add_argument("--phantoms", help="comma-separated phantom id patterns (fnmatch), e.g. 'victre/hetero_*'; "
+                                       "default: the lesion phantoms (oat64 *l, USCT A-D)")
     args = ap.parse_args()
     out = Path(args.out)
     for sub in ("img", "lesion", "label", "raw"):
@@ -42,14 +48,25 @@ def main():
     if json.loads(args.probe_set):
         PROBES[p.probe] = dataclasses.replace(PROBES[p.probe], **json.loads(args.probe_set))
     r = PreviewRenderer()
-    pids = [i.id for i in phantom.list_phantoms() if (i.source == "oat64" and i.id.endswith("l")) or i.source == "usct"]
+    if args.phantoms:
+        pats = args.phantoms.split(",")
+        pids = [i.id for i in phantom.list_phantoms() if any(fnmatch.fnmatch(i.id, q) for q in pats)]
+    else:
+        pids = [i.id for i in phantom.list_phantoms() if (i.source == "oat64" and i.id.endswith("l")) or i.source == "usct"]
     pids = pids[::args.every]
     n = 0
     with open(out / "meta.jsonl", "w") as meta_f:
         for pid in pids:
             vol = phantom.load(pid, log=lambda *a: None)
             r.set_volume(vol)
-            iu, iv = np.nonzero(np.isfinite(vol.surface))
+            ok = np.isfinite(vol.surface)
+            if args.on_breast > 0:
+                from scipy import ndimage
+                breast = ((vol.label > 0) & ~np.isin(vol.label, phantom.CHEST_WALL_LABELS)).any(0)
+                r_px = int(round(args.on_breast / vol.voxel_mm))
+                yy, xx = np.mgrid[-r_px:r_px + 1, -r_px:r_px + 1]
+                ok &= ndimage.binary_erosion(breast, structure=yy ** 2 + xx ** 2 <= r_px ** 2)
+            iu, iv = np.nonzero(ok)
             views = [("lesion", np.array(l["center_mm"][1:]) + rng.normal(0, 3, 2)) for l in vol.meta.get("lesions", [])]
             for _ in range(args.normal_per_phantom):
                 j = rng.integers(len(iu))
@@ -67,7 +84,9 @@ def main():
                 np.save(out / "raw" / name.replace(".png", ".npy"), (r.last_raw / r.last_ref).cpu().numpy().astype(np.float32))
                 meta_f.write(json.dumps(dict(file=name, phantom=pid, view=view, u=float(u), v=float(v),
                                              rotation=pose.rotation, px_mm=meta["px_z_mm"],
-                                             density=pid.split("/")[1][0] if pid.startswith("oat64") else pid[-1])) + "\n")
+                                             density=pid.split("/")[1][0] if pid.startswith("oat64") else
+                                             tissue.VICTRE_DENSITY_BIRADS.get(pid.split("/")[1].split("_")[0], "?")
+                                             if pid.startswith("victre") else pid[-1])) + "\n")
                 n += 1
         print(f"{n} frames -> {out}")
 
