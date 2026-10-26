@@ -243,6 +243,35 @@ def cmd_sheet(a):
     print(f"{len(tiles)} frames -> {a.png or out / 'sheet.png'}")
 
 
+def cmd_stats(a):
+    """Dataset statistics over all shards of the given directories (counts, lesion size / shape / depth, gray)."""
+    import collections
+    M = []
+    for d in a.out:
+        for sh in sorted(Path(d).glob("shard_*.h5")):
+            with h5py.File(sh, "r") as f5:
+                M += [json.loads(m) for m in f5["meta"][:]]
+    pct = lambda v: " / ".join(f"{x:.1f}" for x in np.percentile(v, [5, 25, 50, 75, 95]))
+    src = lambda m: m["phantom"].split("/")[0]
+    print(f"{len(M)} frames; by source/view: {dict(collections.Counter(src(m) + ':' + m['view'] for m in M))}")
+    print(f"phantoms: {len({m['phantom'] for m in M})}, lesion phantoms: {len({m['phantom'] for m in M if m['view'] == 'lesion'})}")
+    for name, sel in [("all", lambda m: True)] + [(k, lambda m, k=k: src(m) == k) for k in ("oat64", "usct", "victre")]:
+        L = [m for m in M if m["view"] == "lesion" and sel(m)]
+        if not L:
+            continue
+        area = np.array([m["lesion_area_mm2"] for m in L])
+        w, h = np.array([m["lesion_w_mm"] for m in L]), np.array([m["lesion_h_mm"] for m in L])
+        print(f"[{name}] {len(L)} lesion frames (5/25/50/75/95 %)\n  area mm2 {pct(area)}\n"
+              f"  eq. diameter mm {pct(2 * np.sqrt(area / np.pi))}\n  width/height {pct(w / h)}, wider-than-tall "
+              f"{(w > h).mean():.2f}\n  top depth mm {pct([m['lesion_top_mm'] for m in L])}\n"
+              f"  centre depth mm {pct([m['lesion_center_mm'] for m in L])}\n"
+              f"  gray lesion {pct([m['gray_lesion'] for m in L])}, tissue {pct([m['gray_tissue'] for m in L])}\n"
+              f"  lesion types {dict(collections.Counter(t for m in L for t in m['lesion_types']))}")
+    print(f"image mean gray {pct([m['gray_mean'] for m in M])}; renders/frame mean "
+          f"{np.mean([m['attempts'] for m in M]):.2f}; |tilt| or |rock| > 12 deg: "
+          f"{sum(max(abs(m['pose']['tilt']), abs(m['pose']['rock'])) > 12 for m in M)}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -266,8 +295,10 @@ def main():
     sh.add_argument("--shard", type=int, default=-1)
     sh.add_argument("--n", type=int, default=24)
     sh.add_argument("--png")
+    st = sub.add_parser("stats")
+    st.add_argument("--out", nargs="+", required=True, help="dataset directories")
     a = ap.parse_args()
-    {"plan": cmd_plan, "render": cmd_render, "sheet": cmd_sheet}[a.cmd](a)
+    {"plan": cmd_plan, "render": cmd_render, "sheet": cmd_sheet, "stats": cmd_stats}[a.cmd](a)
 
 
 if __name__ == "__main__":
