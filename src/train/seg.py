@@ -7,7 +7,7 @@ schedule with 200-iteration warm-up, batch 16, GPU augmentation (random scale 0.
 +-15 deg, translation, horizontal flip, gamma / contrast / brightness, Gaussian noise and blur),
 fixed iteration budget (no early stopping, so the test split is never used for selection).
 
-    python src/train/seg.py cache-sim --sim $BIG/simdata/v1 --out $BIG/simdata/v1/sim256.h5
+    python src/train/seg.py cache-sim --sim $BIG/simdata/v1_base $BIG/simdata/v1_victre --out $BIG/simdata/sim256.h5
     python src/train/seg.py pretrain --data $BIG/simdata/v1/sim256.h5 --init imagenet --out $BIG/seg/sim_in
     python src/train/seg.py finetune --real $BIG/realseg/BUSI.h5 --init sim:$BIG/seg/sim_in/model.pt \
         --n-train 32 --seed 0 --out $BIG/seg/ft/BUSI_n32_simin_s0
@@ -184,7 +184,7 @@ def train(model, x, y, out, iters, dev, lr=5e-4, bs=16, seed=0, log_every=500, e
 def cmd_cache_sim(a):
     """Shards (native 0.078 mm frames) -> one 256 x 256 HDF5 (bilinear image, nearest mask)."""
     imgs, masks, metas = [], [], []
-    for s in sorted(Path(a.sim).glob("shard_*.h5")):
+    for s in sorted(f for d in a.sim for f in Path(d).glob("shard_*.h5")):
         with h5py.File(s, "r") as f:
             for i in range(0, f["img"].shape[0], 256):
                 x = torch.from_numpy(f["img"][i:i + 256]).float()[:, None]
@@ -279,7 +279,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("cache-sim")
-    c.add_argument("--sim", required=True)
+    c.add_argument("--sim", nargs="+", required=True, help="dataset directories with shard_*.h5")
     c.add_argument("--out", required=True)
     p = sub.add_parser("pretrain")
     p.add_argument("--data", required=True)
