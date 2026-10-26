@@ -252,6 +252,25 @@ def cmd_evaluate(a):
         Path(a.out).write_text(json.dumps(res, indent=1))
 
 
+def cmd_summary(a):
+    """Fine-tuning results (result.json under --ft) -> markdown table: mean +- sd over seeds of test Dice / IoU."""
+    import collections
+    rows = collections.defaultdict(list)
+    for f in Path(a.ft).glob("*/result.json"):
+        r = json.loads(f.read_text())
+        rows[(r["dataset"], r["n_train"], r["init"])].append(r)
+    inits = ["none", "imagenet", "sim0", "simin"]
+    print("| dataset | n train | " + " | ".join(f"{i} Dice / IoU" for i in inits) + " |")
+    print("|---|---|" + "---|" * len(inits))
+    for ds, n in sorted({k[:2] for k in rows}):
+        cells = []
+        for i in inits:
+            rs = rows.get((ds, n, i), [])
+            d, u = np.array([r["dice"] for r in rs]), np.array([r["iou"] for r in rs])
+            cells.append(f"{d.mean():.3f}+-{d.std():.3f} / {u.mean():.3f} (n={len(rs)})" if rs else "-")
+        print(f"| {ds} | {n} | " + " | ".join(cells) + " |")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -282,8 +301,11 @@ def main():
     e.add_argument("--real", nargs="+", required=True)
     e.add_argument("--splits", default="test")
     e.add_argument("--out")
+    m = sub.add_parser("summary")
+    m.add_argument("--ft", required=True, help="directory of fine-tuning runs")
     a = ap.parse_args()
-    {"cache-sim": cmd_cache_sim, "pretrain": cmd_pretrain, "finetune": cmd_finetune, "evaluate": cmd_evaluate}[a.cmd](a)
+    {"cache-sim": cmd_cache_sim, "pretrain": cmd_pretrain, "finetune": cmd_finetune, "evaluate": cmd_evaluate,
+     "summary": cmd_summary}[a.cmd](a)
 
 
 if __name__ == "__main__":
