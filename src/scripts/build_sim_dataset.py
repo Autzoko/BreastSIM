@@ -257,6 +257,29 @@ def cmd_sheet(a):
     print(f"{len(tiles)} frames -> {a.png or out / 'sheet.png'}")
 
 
+def cmd_export_realism(a):
+    """Shards -> a realism-benchmark folder (img/, lesion/ PNGs + meta.jsonl, as render_benchmark_set.py),
+    for `realism_benchmark.py extract --sim` on hosts without the phantom source files."""
+    from PIL import Image
+    to = Path(a.to)
+    for sub in ("img", "lesion"):
+        (to / sub).mkdir(parents=True, exist_ok=True)
+    n = 0
+    with open(to / "meta.jsonl", "w") as mf:
+        for sh in sorted(Path(a.out).glob("shard_*.h5")):
+            with h5py.File(sh, "r") as f5:
+                for i in range(f5["img"].shape[0]):
+                    m = json.loads(f5["meta"][i])
+                    name = f"{n:05d}.png"
+                    Image.fromarray(f5["img"][i]).save(to / "img" / name)
+                    Image.fromarray(f5["mask"][i] * 255).save(to / "lesion" / name)
+                    pid = m["phantom"]
+                    dens = pid.split("/")[1][0] if pid.startswith("oat64") else pid[-1] if pid.startswith("usct") else "?"
+                    mf.write(json.dumps(dict(file=name, phantom=pid, view=m["view"], px_mm=m["px_mm"], density=dens)) + "\n")
+                    n += 1
+    print(f"{n} frames -> {to}")
+
+
 def cmd_stats(a):
     """Dataset statistics over all shards of the given directories (counts, lesion size / shape / depth, gray)."""
     import collections
@@ -311,10 +334,14 @@ def main():
     sh.add_argument("--shard", type=int, default=-1)
     sh.add_argument("--n", type=int, default=24)
     sh.add_argument("--png")
+    ex = sub.add_parser("export-realism")
+    ex.add_argument("--out", required=True, help="dataset directory (shards)")
+    ex.add_argument("--to", required=True, help="realism benchmark folder to write")
     st = sub.add_parser("stats")
     st.add_argument("--out", nargs="+", required=True, help="dataset directories")
     a = ap.parse_args()
-    {"plan": cmd_plan, "render": cmd_render, "sheet": cmd_sheet, "stats": cmd_stats}[a.cmd](a)
+    {"plan": cmd_plan, "render": cmd_render, "sheet": cmd_sheet, "stats": cmd_stats,
+     "export-realism": cmd_export_realism}[a.cmd](a)
 
 
 if __name__ == "__main__":
