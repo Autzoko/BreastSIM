@@ -446,7 +446,8 @@ class PreviewRenderer:
                 two_way = -2 * torch.log(T.clamp(min=1e-6))
                 capped = torch.where(thin, torch.clamp(0.3 * two_way, max=cap_thin), torch.clamp(two_way, max=cap_bulk))
                 # bone and air interfaces (|r| > 0.3) block the beam outright: no soft-tissue cap
-                two_way = torch.where(((z2 - z1) / (z2 + z1)).abs() > 0.3, two_way.clamp(max=30.0), capped)
+                # (thin strong reflectors smaller than the beam, i.e. calcifications, do not block)
+                two_way = torch.where((((z2 - z1) / (z2 + z1)).abs() > 0.3) & ~thin, two_way.clamp(max=30.0), capped)
                 loss.index_put_((iz + 1, ix), two_way, accumulate=True)
                 # echo
                 r = (z2 - z1) / (z2 + z1)

@@ -26,7 +26,7 @@ from . import paths, tissue
 
 PREVIEW_VOXEL_MM = 0.2
 CACHE_VERSION = 4   # bump to rebuild caches after changing the conversion
-VICTRE_CONTENT_VERSION = 1   # VICTRE-only conversion (fascia band, echogenicity mixture): rebuilds VICTRE caches only
+VICTRE_CONTENT_VERSION = 2   # VICTRE-only conversion (fascia band, echogenicity mixture, typed-lesion recipes): rebuilds VICTRE caches only
 WATER_Z, WATER_ALPHA, WATER_C = 1.5, 0.025, 1500.0
 
 # Li et al. 2021, power-law exponent per BI-RADS type.
@@ -100,7 +100,8 @@ def list_phantoms():
             f, lesions = les, f"{i['n']} breastMass {i['kind']} lesion(s), radius {i['alpha_mm']} mm"
         else:
             lesions = "healthy"
-        out.append(PhantomInfo(f"victre/{variant}_{seed}", "victre", {"raw": f, "generation": gen},
+        files = {"raw": f, "generation": gen, **({"insertion": ins} if les.exists() and ins.exists() else {})}
+        out.append(PhantomInfo(f"victre/{variant}_{seed}", "victre", files,
                                f"VICTRE {g['density']} (BI-RADS {tissue.VICTRE_DENSITY_BIRADS[g['density']]}), "
                                f"seed {seed}{', ' + extra if extra else ''}, {lesions}"))
     for f in sorted((paths.DATA / "oa_breast").glob("*.h5")):
@@ -235,12 +236,22 @@ def _load_victre(info):
     hdr = dict(l.split(" = ", 1) for l in raw.with_suffix("").with_suffix(".mhd").read_text().strip().splitlines())
     nx, ny, nz = map(int, hdr["DimSize"].split())
     voxel = float(hdr["ElementSpacing"].split()[0])
-    with gzip.open(raw) as f:
-        label = np.frombuffer(f.read(), np.uint8).reshape(nz, ny, nx)
+    read = lambda p: np.frombuffer(gzip.open(p).read(), np.uint8).reshape(nz, ny, nx)
+    label = read(raw)
     k = _factor(voxel)
     src, label = label, _downsample_labels(label, k)
     mod = _echo_mix(src, label, k) if k > 1 else None
     del src
+    host = raw.with_name(raw.name.replace("pcl_", "p_", 1))
+    if host != raw and host.exists() and "insertion" in info.files:
+        # typed lesions: keep the backscatter of the host tissue the mass replaced (fat / gland / ligaments
+        # left inside an infiltrating tumour), as a factor over tumour echogenicity on the lesion voxels;
+        # breastsim.lesions.apply_content uses it as the internal pattern of non-circumscribed lesions
+        e = tissue.lut(tissue.ECHOGENICITY)
+        les = np.isin(label, tissue.LESIONS) & (label != tissue.CALC)
+        hl = _stride(read(host), k)[les]
+        mod = np.ones(label.shape, np.float16) if mod is None else mod
+        mod[les] = np.maximum(e[hl], 0.05) / np.maximum(e[label[les]], 1e-6)
     label = _add_fascia(label, voxel * k)
     if mod is not None:
         mod[label == tissue.FASCIA] = 1.0
@@ -274,7 +285,31 @@ def _orient(label):
     return order, flip
 
 
-def canonicalize(label, z, alpha, c=None, margin=4, extra=()):
+CANON_MARGIN = 4
+
+
+def _attach_recipes(info, lesions, ori, voxel, shape_src):
+    """Lesion recipes of a typed VICTRE insertion (insertion.json "lesions": recipe + centre in mm of the
+    source array, (z, y, x) order) attached to the nearest lesion found in the canonical volume."""
+    f = info.files.get("insertion")
+    recs = json.loads(f.read_text()).get("lesions") if f else None
+    if not recs:
+        return
+    order, flip, lo = ori["axis_order"], ori["flip"], ori["crop_lo"]
+    n_t = [shape_src[a] for a in order]
+    for rec in recs:
+        t = (np.round(np.asarray(rec["center_mm_zyx"]) / voxel).astype(int))[list(order)]
+        if flip:
+            t[0] = n_t[0] - 1 - t[0]
+        ctr = (t - np.asarray(lo) + [0, CANON_MARGIN, CANON_MARGIN]) * voxel
+        # the mass and its detached fragments (spicule pieces) within 1.5 x its diameter share the recipe
+        reach = 0.75 * rec.get("eqdiam_mm", 10.0) + 2
+        for l in lesions:
+            if np.linalg.norm(np.asarray(l["center_mm"]) - ctr) < max(reach, 1.5 * rec.get("eqdiam_mm", 10.0)):
+                l["recipe"] = rec["recipe"]
+
+
+def canonicalize(label, z, alpha, c=None, margin=CANON_MARGIN, extra=()):
     """Reorder to (A, U, V) with the chest wall at A=0, crop, pad with water.
 
     Returns (label, z, alpha, ori), or (label, z, alpha, c, ori) when c is given; `extra` (array, fill)
@@ -298,6 +333,11 @@ def canonicalize(label, z, alpha, c=None, margin=4, extra=()):
     return (*out, {"axis_order": order, "flip": bool(flip), "crop_lo": lo})
 
 
+# lesion appearance from real annotated lesion types (breastsim.lesions); 0 = legacy draws (posterior only,
+# label echogenicity). Env BREASTSIM_LESION_TYPES for experiments.
+LESION_TYPES = int(os.environ.get("BREASTSIM_LESION_TYPES", 1))
+
+
 def lesion_acoustics(pid, lesions):
     """Per-lesion posterior feature and attenuation slope, deterministic per phantom/lesion.
 
@@ -306,14 +346,23 @@ def lesion_acoustics(pid, lesions):
     "attenuation_db_cm_mhz" to each lesion dict.
     """
     import zlib
+    from . import lesions as lesion_types
     codes = {v: k for k, v in tissue.NAMES.items()}
     for les in lesions:
         rng = np.random.default_rng(zlib.crc32(f"{pid}#{les['id']}".encode()))
         main = codes.get(les["type"], tissue.TUMOR)
-        probs = tissue.POSTERIOR_FEATURE_PROBS.get(main, tissue.POSTERIOR_FEATURE_PROBS[tissue.TUMOR])
-        feats = list(probs)
-        feat = feats[rng.choice(len(feats), p=np.array(list(probs.values())) / sum(probs.values()))]
-        lo, hi = tissue.CYST_ATTENUATION_DB_CM_MHZ if main == tissue.CYST else tissue.POSTERIOR_ATTENUATION_DB_CM_MHZ[feat]
+        if LESION_TYPES:
+            # recipe of a typed insertion (insertion.json) or drawn here; simple cysts keep anechoic recipes
+            r = les.setdefault("recipe", lesion_types.sample_recipe(f"{pid}#{les['id']}",
+                                                                    "anechoic" if main == tissue.CYST else None))
+            feat = lesion_types.POSTERIOR.get(r["posterior"], "none")
+            fluid = main == tissue.CYST or r["echo"] == "anechoic"
+        else:
+            probs = tissue.POSTERIOR_FEATURE_PROBS.get(main, tissue.POSTERIOR_FEATURE_PROBS[tissue.TUMOR])
+            feats = list(probs)
+            feat = feats[rng.choice(len(feats), p=np.array(list(probs.values())) / sum(probs.values()))]
+            fluid = main == tissue.CYST
+        lo, hi = tissue.CYST_ATTENUATION_DB_CM_MHZ if fluid else tissue.POSTERIOR_ATTENUATION_DB_CM_MHZ[feat]
         les["posterior"] = feat
         les["attenuation_db_cm_mhz"] = round(float(lo + rng.random() * (hi - lo)), 3)
     return lesions
@@ -398,6 +447,7 @@ def build_cache(pid, log=print):
     log(f"[phantom] {pid}: [1/4] reading source files ({info.source})")
     label, z, alpha, c, voxel, power, *rest = LOADERS[info.source](info)
     mod = rest[0] if rest else None
+    shape_src = label.shape
     log(f"[phantom] {pid}: [2/4] reorienting and writing preview volume")
     if mod is not None:
         label, z, alpha, c, mod, ori = canonicalize(label, z, alpha, c, extra=[(mod, 1.0)])
@@ -405,6 +455,7 @@ def build_cache(pid, log=print):
         label, z, alpha, c, ori = canonicalize(label, z, alpha, c)
     log(f"[phantom] {pid}: [3/4] finding lesions")
     lesions, lesion_id = find_lesions(label, voxel, return_ids=True)
+    _attach_recipes(info, lesions, ori, voxel, shape_src)
     out = cache_dir(pid)
     out.mkdir(parents=True, exist_ok=True)
     (out / "meta.json").unlink(missing_ok=True)   # meta.json last = cache complete
@@ -481,7 +532,11 @@ def load(pid, log=print, chest_wall=True):
                  np.load(d / "lesion_proj.npy"), meta, np.load(d / "c.npy"), np.load(d / "lesion_id.npy"),
                  echo_mod=np.load(d / "echo_mod.npy") if (d / "echo_mod.npy").exists() else None)
     # VICTRE phantoms carry their own pectoralis (label 40) at the chest wall
-    return add_chest_wall(vol) if chest_wall and meta["source"] != "victre" else vol
+    vol = add_chest_wall(vol) if chest_wall and meta["source"] != "victre" else vol
+    if LESION_TYPES:
+        from . import lesions as lesion_types
+        lesion_types.apply_content(vol)
+    return vol
 
 
 def add_chest_wall(vol, depth_mm=25.0):
@@ -528,6 +583,8 @@ def add_chest_wall(vol, depth_mm=25.0):
         vol.c = cat(c[label], vol.c)
     if vol.lesion_id is not None:
         vol.lesion_id = cat(np.zeros(label.shape, np.uint8), vol.lesion_id)
+    if vol.echo_mod is not None:
+        vol.echo_mod = cat(np.ones(label.shape, np.float16), vol.echo_mod)
     vol.a0_mm -= pad * vox
     vol.meta["chest_wall"] = {"depth_mm": pad * vox, "muscle_mm": [8.0, 12.5], "rib_u_mm": rib_u.tolist(),
                               "rib_half_width_mm": rib_hw, "rib_half_height_mm": rib_hh,

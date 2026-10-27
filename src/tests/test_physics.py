@@ -174,16 +174,21 @@ def test_shadowing_lesion_darkens_posterior_region():
     assert prof_sh[mid].mean() < prof_none[mid].mean() - 10      # 3 dB/cm/MHz, 8 mm, 7.6 MHz: strong shadow
 
 
-def test_posterior_features_follow_dataset_frequencies():
+def test_posterior_features_follow_lesion_types():
+    # typed lesions (breastsim.lesions): posterior feature of the drawn real lesion, tempered type weights
+    from breastsim import lesions as lt
     lesions = [{"id": i, "type": tissue.NAMES[tissue.TUMOR]} for i in range(2000)]
     phantom.lesion_acoustics("x/y", lesions)
     again = phantom.lesion_acoustics("x/y", [{"id": i, "type": tissue.NAMES[tissue.TUMOR]} for i in range(2000)])
     assert [l["posterior"] for l in lesions] == [l["posterior"] for l in again]     # deterministic
-    freq = {k: np.mean([l["posterior"] == k for l in lesions]) for k in tissue.POSTERIOR_FEATURE_PROBS[tissue.TUMOR]}
-    for k, pr in tissue.POSTERIOR_FEATURE_PROBS[tissue.TUMOR].items():
-        assert freq[k] == pytest.approx(pr, abs=0.04)
+    cases = lt.load_types()["cases"]
+    w = np.array([c["weight"] for c in cases])
+    for k, feat in lt.POSTERIOR.items():
+        expect = w[[c["posterior"] == k for c in cases]].sum() / w.sum()
+        assert np.mean([l["posterior"] == feat for l in lesions]) == pytest.approx(expect, abs=0.04)
     for l in lesions:
-        lo, hi = tissue.POSTERIOR_ATTENUATION_DB_CM_MHZ[l["posterior"]]
+        lo, hi = (tissue.CYST_ATTENUATION_DB_CM_MHZ if l["recipe"]["echo"] == "anechoic"
+                  else tissue.POSTERIOR_ATTENUATION_DB_CM_MHZ[l["posterior"]])
         assert lo <= l["attenuation_db_cm_mhz"] <= hi
 
 

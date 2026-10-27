@@ -4,6 +4,7 @@
     python src/scripts/phantom_grid.py grid outputs/realism/sim/vh1 [--n 16]   # 4x4 grid, lesion outlines, label stats
     python src/scripts/phantom_grid.py real BrEaST [--n 16]                       # same grid of real images
     python src/scripts/phantom_grid.py geom victre/hetero_1 [...]                 # skin-to-chest-wall thickness
+    python src/scripts/phantom_grid.py crops outputs/realism/sim/x --out c.png     # lesion crops per echo type, real vs sim
 
 `grid` reads a set written by render_benchmark_set.py (img/, lesion/, label/, meta.jsonl) and writes
 <set>/grid.png and <set>/label_stats.json. Label statistics per frame (simulation only, from the
@@ -122,6 +123,46 @@ def cmd_real(a):
     print(out)
 
 
+def _crop(g, les, size=150, pad=0.5):
+    rows, cols = np.nonzero(les)
+    h, w = np.ptp(rows) + 1, np.ptp(cols) + 1
+    side = int(max(h, w) * (1 + 2 * pad))
+    cy, cx = int(rows.mean()), int(cols.mean())
+    y0, x0 = max(0, cy - side // 2), max(0, cx - side // 2)
+    sub = outline(np.clip(g, 0, 255)[y0:y0 + side, x0:x0 + side], les[y0:y0 + side, x0:x0 + side])
+    return np.asarray(Image.fromarray(sub).resize((size, size), Image.BILINEAR))
+
+
+def cmd_crops(a):
+    """Lesion crops per echo pattern: real BrEaST (top row of each type) vs simulated sets (bottom row)."""
+    from breastsim import realism
+    types = ["anechoic", "hypoechoic", "isoechoic", "hyperechoic", "heterogeneous", "complex cystic/solid"]
+    rng = np.random.default_rng(0)
+    real = {t: [] for t in types}
+    for s_ in realism.breast():
+        t = s_["info"].get("echo")
+        if t in real and s_["lesion"].any():
+            real[t].append(_crop(s_["gray"], s_["lesion"]))
+    sim = {t: [] for t in types}
+    for root in map(Path, a.sets):
+        for l in (root / "meta.jsonl").read_text().splitlines():
+            m = json.loads(l)
+            t = m.get("lesion_echo")
+            les = np.asarray(Image.open(root / "lesion" / m["file"]).convert("L")) > 127
+            if t in sim and les.sum() > 50:
+                g = np.asarray(Image.open(root / "img" / m["file"]).convert("L")).astype(np.float32)
+                sim[t].append(_crop(g, les))
+    tiles, caps = [], []
+    for t in types:
+        for src, d in (("real", real[t]), ("sim", sim[t])):
+            pick = [d[i] for i in rng.permutation(len(d))[:a.n]]
+            for k in range(a.n):
+                tiles.append(pick[k] if k < len(pick) else np.zeros((150, 150, 3), np.uint8))
+                caps.append(f"{src} {t[:12]}" if k == 0 else "")
+    montage(tiles, Path(a.out), cols=a.n, w=150, captions=caps)
+    print(a.out, {t: (len(real[t]), len(sim[t])) for t in types})
+
+
 def cmd_geom(a):
     from breastsim import phantom
     for pid in a.ids:
@@ -151,10 +192,14 @@ def main():
     r.add_argument("dataset")
     r.add_argument("--n", type=int, default=16)
     r.add_argument("--seed", type=int, default=0)
+    c = sub.add_parser("crops")
+    c.add_argument("sets", nargs="+")
+    c.add_argument("--out", required=True)
+    c.add_argument("--n", type=int, default=6)
     m = sub.add_parser("geom")
     m.add_argument("ids", nargs="+")
     a = ap.parse_args()
-    {"grid": cmd_grid, "real": cmd_real, "geom": cmd_geom}[a.cmd](a)
+    {"grid": cmd_grid, "real": cmd_real, "geom": cmd_geom, "crops": cmd_crops}[a.cmd](a)
 
 
 if __name__ == "__main__":

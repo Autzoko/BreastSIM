@@ -27,28 +27,31 @@ MUSCLE = 40          # pectoralis / intercostal muscle
 FASCIA = 45          # pectoral fascia and perimysial septa
 RIB = 60
 LUNG = 70            # aerated lung behind the pleura
+CALC = 250           # calcification (VICTRE calcification cluster material, inserted inside masses)
 
 NAMES = {
     BACKGROUND: "background", FAT: "fat", SKIN: "skin", EPIDERMIS: "epidermis",
     GLAND: "glandular", NIPPLE: "nipple", LIGAMENT: "ligament", TDLU: "TDLU",
     DUCT: "duct", ARTERY: "artery", CYST: "simple cyst", FIBROADENOMA: "fibroadenoma",
     ANGIOGENESIS: "peripheral angiogenesis", TUMOR: "viable tumor", NECROSIS: "necrotic core",
-    VEIN: "vein", MUSCLE: "muscle", FASCIA: "fascia", RIB: "rib", LUNG: "lung (air)",
+    VEIN: "vein", MUSCLE: "muscle", FASCIA: "fascia", RIB: "rib", LUNG: "lung (air)", CALC: "calcification",
 }
 
 # Labels that make up the segmentation / detection target. Peripheral
 # angiogenesis (IDB-8164905 label_pa) is an optical/functional property of the
 # tissue around a tumour, not a sonographic mass, so it is not a lesion label.
-LESIONS = (CYST, FIBROADENOMA, TUMOR, NECROSIS)
+LESIONS = (CYST, FIBROADENOMA, TUMOR, NECROSIS, CALC)   # calcifications only occur inside masses (part of the mask)
 
 # Diffuse fraction of boundary echoes (specular otherwise): soft-tissue interfaces
 # are smooth, the cortical bone surface and the pleura are rough and stay bright
 # at oblique incidence.
-ROUGHNESS = {RIB: 0.8, LUNG: 0.6}
+ROUGHNESS = {RIB: 0.8, LUNG: 0.6, CALC: 0.8}
 DEFAULT_ROUGHNESS = 0.25
 
 # Sheet- or tube-like structures thinner than the ultrasound beam.
-THIN_STRUCTURES = (SKIN, EPIDERMIS, LIGAMENT, DUCT, ARTERY, VEIN, FASCIA)
+# Calcifications (0.2-0.6 mm here) are smaller than the beam: they reflect strongly but the beam passes around
+# them (no bone-like blocking in the renderer).
+THIN_STRUCTURES = (SKIN, EPIDERMIS, LIGAMENT, DUCT, ARTERY, VEIN, FASCIA, CALC)
 
 # Relative backscatter amplitude (std of sub-resolution scatterers).
 # Breast US appearance: fat hypoechoic, glandular / ligaments / skin
@@ -57,8 +60,11 @@ ECHOGENICITY = {
     BACKGROUND: 0.0, FAT: 0.35, SKIN: 1.1, EPIDERMIS: 1.3, GLAND: 1.0, NIPPLE: 0.5,
     LIGAMENT: 1.4, TDLU: 0.7, DUCT: 0.1, ARTERY: 0.03, CYST: 0.02, FIBROADENOMA: 0.25,
     ANGIOGENESIS: 0.4, TUMOR: 0.1, NECROSIS: 0.05, VEIN: 0.03,
-    MUSCLE: 0.3, FASCIA: 1.3, RIB: 0.0, LUNG: 0.0,
+    MUSCLE: 0.3, FASCIA: 1.3, RIB: 0.0, LUNG: 0.0, CALC: 3.0,
 }
+# Test option (not adopted): breast fat backscatter 13-15 dB below fibroglandular tissue in vivo (Anderson,
+# Soo, Trahey, UMB 2001, 7-10 MHz) -> fat ~0.2 instead of 0.35 (9.1 dB). Adopting it needs a display refit.
+ECHOGENICITY[FAT] = float(__import__("os").environ.get("BREASTSIM_FAT_ECHO", ECHOGENICITY[FAT]))
 
 # Acoustic properties for sources that only provide labels (OA-Breast):
 # (speed of sound m/s, density kg/m^3, attenuation Np/m/MHz^y).
@@ -87,6 +93,7 @@ VICTRE_ACOUSTIC = {
     TDLU: (1532.9, 1033.0, 8.18), DUCT: (1518.4, 1012.0, 7.58), ARTERY: (1536.2, 1012.0, 4.29),
     VEIN: (1536.7, 1012.0, 4.31), TUMOR: (1530.1, 955.0, 23.27), MUSCLE: DEFAULT_ACOUSTIC[MUSCLE],
     FASCIA: DEFAULT_ACOUSTIC[FASCIA],
+    CALC: DEFAULT_ACOUSTIC[RIB],      # hydroxyapatite: bone-like values (cortical bone, DEFAULT_ACOUSTIC)
 }
 # power-law exponent per VICTRE density class, as the IDB-8164905 / USCT phantoms of BI-RADS A-D
 VICTRE_DENSITY_BIRADS = {"fatty": "A", "scattered": "B", "hetero": "C", "dense": "D"}
@@ -126,7 +133,7 @@ COLORS = {
     GLAND: (120, 170, 240), NIPPLE: (200, 120, 200), LIGAMENT: (250, 250, 250), TDLU: (90, 140, 220),
     DUCT: (60, 90, 200), ARTERY: (220, 40, 40), CYST: (40, 220, 220), FIBROADENOMA: (240, 200, 40),
     ANGIOGENESIS: (250, 120, 40), TUMOR: (250, 40, 40), NECROSIS: (130, 20, 20), VEIN: (60, 40, 200),
-    MUSCLE: (170, 60, 70), FASCIA: (235, 210, 210), RIB: (245, 240, 220), LUNG: (40, 40, 60),
+    MUSCLE: (170, 60, 70), FASCIA: (235, 210, 210), RIB: (245, 240, 220), LUNG: (40, 40, 60), CALC: (255, 255, 255),
 }
 
 

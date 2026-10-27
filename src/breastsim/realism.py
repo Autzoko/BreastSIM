@@ -115,7 +115,8 @@ def breast():
         other = _mask(glob.glob(str(f)[:-4] + "_other*.png"), g.shape)
         yield dict(id=str(f), gray=g, lesion=les, bad=col | other, px_mm=float(row.Pixel_size) * 10,   # cm -> mm
                    info=dict(group=row.Classification, composition=row.Tissue_composition, shape=row.Shape,
-                             margin=row.Margin, posterior_label=row.Posterior_features))
+                             margin=row.Margin, posterior_label=row.Posterior_features, echo=row.Echogenicity,
+                             halo=row.Halo, calcifications=row.Calcifications))
 
 
 def abus(n_vol=100, normal_slices=2):
