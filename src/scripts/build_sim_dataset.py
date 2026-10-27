@@ -32,7 +32,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from breastsim import phantom, tissue
+from breastsim import devices, phantom, tissue
 from breastsim.probe import PROBES, ProbePose, skin_offsets
 from breastsim.realtime.renderer import ImagingParams, PreviewRenderer
 
@@ -75,9 +75,13 @@ def cmd_plan(a):
     frames.sort(key=lambda f: f["phantom"])            # shards load each phantom once
     for i, f in enumerate(frames):
         f["idx"] = i
+        if a.devices:   # virtual device per frame (breastsim.devices); poses do not depend on it
+            d = devices.sample_device(np.random.default_rng(zlib.crc32(f"{a.seed}#dev{i}".encode())))
+            f["device"] = {k: d[k] for k in ("weights", "fc_mhz", "bandwidth")} | {
+                k: v for k, v in d["params"].items() if k != "probe"}
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    plan = dict(preset=a.preset, seed=a.seed, min_area_mm2=a.min_area, depth_scale_mm=a.depth_scale,
+    plan = dict(preset=a.preset, seed=a.seed, devices=a.devices, min_area_mm2=a.min_area, depth_scale_mm=a.depth_scale,
                 n=a.n, pos_frac=a.pos_frac, frames=frames)
     (out / "plan.json").write_text(json.dumps(plan))
     by = {}
@@ -160,6 +164,15 @@ def cmd_render(a):
         np.array_split(np.array(plan["frames"], dtype=object), a.shards)[a.shard].tolist()
     p = ImagingParams.from_preset(plan["preset"], overlay="none")
     spec = PROBES[p.probe]
+    use_dev = plan.get("devices") and not a.no_devices
+
+    def frame_params(f):
+        if not use_dev:
+            return p
+        d = f["device"]
+        probe = devices.probe_variant(p.probe, d["fc_mhz"], d["bandwidth"])
+        return ImagingParams.from_preset(plan["preset"], overlay="none", probe=probe,
+                                         **{k: v for k, v in d.items() if k not in ("weights", "fc_mhz", "bandwidth")})
     r = PreviewRenderer()
     f5 = h5py.File(out / f"shard_{a.shard:03d}.h5", "a")
     if "img" not in f5:
@@ -170,6 +183,7 @@ def cmd_render(a):
         f5.create_dataset("meta", (0,), h5py.string_dtype(), maxshape=(None,), chunks=(256,))
         f5.attrs["plan"] = json.dumps({k: v for k, v in plan.items() if k != "frames"})
         f5.attrs["imaging"] = json.dumps({k: v for k, v in vars(p).items()}, default=str)
+        f5.attrs["devices"] = bool(use_dev)
     done = {json.loads(m)["idx"] for m in f5["meta"][:]}
     todo = [f for f in frames if f["idx"] not in done]
     print(f"shard {a.shard}/{a.shards}: {len(frames)} frames, {len(todo)} to render", flush=True)
@@ -188,7 +202,7 @@ def cmd_render(a):
                 if f["view"] == "lesion" else normal_pose(vol, rng)
             if pose is None:
                 continue
-            img, meta, lab = r.render(pose, p)
+            img, meta, lab = r.render(pose, frame_params(f))
             img, les = img[..., 0], clean_mask(np.isin(lab, tissue.LESIONS))
             area = les.sum() * meta["px_x_mm"] * meta["px_z_mm"]
             ok = (lab == tissue.BACKGROUND).mean() <= 0.02 and (
@@ -284,12 +298,14 @@ def main():
     pl.add_argument("--min-area", type=float, default=4.0, help="mm2 of lesion in a lesion frame")
     pl.add_argument("--depth-scale", type=float, default=12.0, help="mm, preference for shallow lesion placements")
     pl.add_argument("--seed", type=int, default=0)
+    pl.add_argument("--devices", action="store_true", help="draw a virtual device per frame (breastsim.devices)")
     rd = sub.add_parser("render")
     rd.add_argument("--out", required=True)
     rd.add_argument("--shard", type=int, default=0)
     rd.add_argument("--shards", type=int, default=1)
     rd.add_argument("--interleave", action="store_true", help="every k-th frame (small test batches)")
     rd.add_argument("--max-tries", type=int, default=20)
+    rd.add_argument("--no-devices", action="store_true", help="ignore the plan's virtual devices (ablation)")
     sh = sub.add_parser("sheet")
     sh.add_argument("--out", required=True)
     sh.add_argument("--shard", type=int, default=-1)
