@@ -10,15 +10,16 @@ it at load time (apply_content), deterministically per phantom / lesion:
 - internal echogenicity: lesion backscatter amplitude = ratio x rms echogenicity of the host tissue 1-3 mm
   around it; the ratio is the inverse of the rendered contrast curve (CONTRAST_CURVE, measured on simulated
   lesions with breastsim.realism.lesion_features) at the recipe's measured contrast (contrast_sd on the real
-  image); circumscribed lesions are homogeneous, non-circumscribed / heterogeneous ones keep the backscatter
-  pattern of the host tissue they replaced (entrapped fat / stroma) at that mean level;
+  image); circumscribed lesions are homogeneous, non-circumscribed / heterogeneous ones keep the square root of
+  the backscatter pattern of the host tissue they replaced (entrapped fat / stroma residues) around that level
+  (log mean: a full-depth pattern made infiltrating lesions look like background);
 - complex cystic / solid: fluid (anechoic) parts, ~CYSTIC_CORE_FRACTION of the lesion volume, where the
   replaced host tissue was least echogenic (irregular, anatomy-shaped); without a host pattern the deepest voxels;
 - non-circumscribed margins: an infiltration transition zone of TRANSITION_MM on both sides of the boundary
   where tumour and host backscatter mix by volume fraction (linear in intensity with signed distance);
 - echogenic halo (annotated halo): host tissue within HALO_REL_WIDTH x diameter outside the lesion gets
-  HALO_FACTOR x its backscatter amplitude; circumscribed masses without halo get a thin echogenic pseudocapsule
-  (CAPSULE_MM, CAPSULE_FACTOR);
+  HALO_FACTOR x its backscatter amplitude; the others get a thin echogenic rim (RIM_MM) whose factor reproduces
+  the real case's measured edge_sharpness (EDGE_CURVE);
 - posterior features: the recipe's annotated feature (phantom.lesion_acoustics).
 Masks never change: everything acts on the backscatter factor (Volume.echo_mod) and the lesion attenuation.
 """
@@ -44,10 +45,27 @@ CYSTIC_CORE_FRACTION = 0.4
 TRANSITION_MM = 0.4            # 0.8 mm gave edge_sharpness 0.99 vs real 1.16-1.29 (non-circumscribed)
 HALO_REL_WIDTH = 0.15           # realism.lesion_features measures the halo over 0.15 x diameter
 HALO_FACTOR = 1.5
-# circumscribed masses: "thin echogenic pseudocapsule" (Stavros et al., Radiology 1995;196:123, benign criteria);
-# also what puts the real-mask rim above the surroundings (BrEaST halo_sd ~0.2 in every type)
-CAPSULE_MM = 0.4
-CAPSULE_FACTOR = 1.4            # 1.6 gave halo_sd 0.34-0.54 vs real ~0.23
+# Boundary rim (no annotated halo): a thin echogenic border just outside the lesion - "thin echogenic
+# pseudocapsule" of circumscribed masses (Stavros et al., Radiology 1995;196:123), compressed / desmoplastic
+# host tissue at the border of the others. Its factor is chosen per lesion so that the rendered edge_sharpness
+# matches the real case's (EDGE_CURVE: edge_sharpness vs rim factor at a few contrast ratios, measured on
+# rendered typed masses with src/scripts/lesion_calibrate.py --rims). Real lesions low in contrast are visible
+# through this edge (les_v4/v5: heterogeneous cases with contrast_sd ~0 rendered invisible without it).
+RIM_MM = 0.5
+EDGE_CURVE = {"ratio": [0.2, 0.5, 0.8, 1.2], "factor": [1.0, 1.4, 1.8, 2.4],
+              "edge": [[1.283, 1.440, 1.535, 1.623], [1.098, 1.248, 1.358, 1.475], [1.022, 1.142, 1.239, 1.356],
+                       [1.013, 1.076, 1.145, 1.237]]}      # 28 masses x 2 poses per cell (2026-10-27)
+
+
+def rim_factor(r):
+    """Rim factor reproducing the recipe's edge_sharpness at its contrast ratio (bilinear in EDGE_CURVE)."""
+    if r.get("rim_factor") is not None:          # explicit (calibration)
+        return float(r["rim_factor"])
+    want = r.get("edge_sharpness") or 1.2
+    q = echo_ratio(r)
+    rr, ff, ee = EDGE_CURVE["ratio"], EDGE_CURVE["factor"], np.asarray(EDGE_CURVE["edge"])
+    edges = [np.interp(np.log(q), np.log(rr), ee[:, j]) for j in range(len(ff))]   # edge per factor at this ratio
+    return float(np.clip(np.interp(want, edges, ff), ff[0], 3.0))
 POSTERIOR = {"no": "none", "shadowing": "shadowing", "enhancement": "enhancement", "combined": "combined"}
 
 
@@ -121,7 +139,9 @@ def apply_content(vol):
         if (r["margin"] != "circumscribed" or r["echo"] == "heterogeneous") and solid.any():
             # infiltrating / heterogeneous: internal pattern of the host tissue the mass replaced (typed VICTRE
             # insertions keep it in echo_mod) or the lesion's own sub-labels, at the target mean level
-            pat = amp / np.sqrt(np.mean(amp[solid] ** 2))
+            # pattern at reduced depth (square root: the tumour replaces most of the tissue, residues stay)
+            # around the log mean (as e_host), so the lesion's displayed median sits at the target contrast
+            pat = np.sqrt(np.maximum(amp, 1e-3) / np.exp(np.mean(np.log(np.maximum(amp[solid], 1e-3)))))
         else:
             # circumscribed: homogeneous except sub-labels (e.g. a necrotic core keeps its echogenicity
             # relative to the lesion's main tissue)
@@ -147,9 +167,11 @@ def apply_content(vol):
         if r.get("halo"):
             rim = host & (d_out > 0) & (d_out <= HALO_REL_WIDTH * d)
             target[rim] *= HALO_FACTOR
-        elif r["margin"] == "circumscribed":                       # thin echogenic pseudocapsule
-            rim = host & (d_out > 0) & (d_out <= CAPSULE_MM)
-            target[rim] *= CAPSULE_FACTOR
+        else:
+            # boundary cue: pseudocapsule (circumscribed) / compressed, desmoplastic host tissue at the border
+            # (others), with the factor that reproduces the real case's own edge_sharpness at its contrast
+            rim = host & (d_out > 0) & (d_out <= RIM_MM)
+            target[rim] *= rim_factor(r)
         base = e_lut[lab]
         upd = (solid | host) & (base > 0)
         mod[upd] = target[upd] / base[upd]

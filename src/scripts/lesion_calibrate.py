@@ -5,7 +5,7 @@
 
 Every lesion of >= 4 mm of the given phantoms is rendered (preset breast, --poses frames through its centre
 at random rotations) with its backscatter amplitude set to ratio x the host rms (circumscribed, no halo, no
-posterior feature), and contrast_sd / inner_heterogeneity / edge_sharpness are measured with
+posterior feature) and each --rims factor of the boundary rim, and contrast_sd / inner_heterogeneity / edge_sharpness are measured with
 breastsim.realism.lesion_features exactly as on the real images. Prints the median per ratio.
 """
 import argparse
@@ -25,6 +25,7 @@ def main():
     ap.add_argument("--phantoms", required=True)
     ap.add_argument("--ratios", default="0.05,0.1,0.2,0.35,0.5,0.7,1.0,1.4,2.0")
     ap.add_argument("--poses", type=int, default=3)
+    ap.add_argument("--rims", default="1.0", help="rim factors (breastsim.lesions EDGE_CURVE), e.g. 1.0,1.4,1.8,2.4")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     ratios = [float(x) for x in a.ratios.split(",")]
@@ -38,11 +39,11 @@ def main():
         base = np.load(f) if f.exists() else np.ones(vol.label.shape, np.float16)
         main = [l for l in vol.meta["lesions"] if l["diameter_mm"] >= 4]
         poses = {l["id"]: rng.uniform(-180, 180, a.poses) for l in main}
-        for ratio in ratios:
+        for ratio, rim in [(q, f) for q in ratios for f in [float(x) for x in a.rims.split(",")]]:
             vol.echo_mod = base.copy()
             for l in vol.meta["lesions"]:
                 l["recipe"] = {**l["recipe"], "echo_ratio": ratio, "echo": "hypoechoic", "margin": "circumscribed",
-                               "halo": False}
+                               "halo": False, "rim_factor": rim}
                 l["attenuation_db_cm_mhz"] = 0.6
             lesions.apply_content(vol)
             rend.set_volume(vol)
@@ -58,11 +59,11 @@ def main():
                         continue
                     g = img[..., 0].astype(np.float32)
                     f_ = realism.lesion_features(g, les, realism.tissue_mask(g), meta["px_z_mm"])
-                    rows.append({"phantom": pid, "lesion": l["id"], "ratio": ratio, **f_})
+                    rows.append({"phantom": pid, "lesion": l["id"], "ratio": ratio, "rim": rim, **f_})
         print(pid, len(rows), flush=True)
     json.dump(rows, open(a.out, "w"))
     import pandas as pd
-    t = pd.DataFrame(rows).groupby("ratio")[["contrast_sd", "inner_heterogeneity", "edge_sharpness", "halo_sd"]]
+    t = pd.DataFrame(rows).groupby(["ratio", "rim"])[["contrast_sd", "inner_heterogeneity", "edge_sharpness", "halo_sd"]]
     print(t.median().round(3).to_string())
     print("n per ratio:", t.size().to_dict())
 

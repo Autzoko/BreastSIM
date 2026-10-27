@@ -34,6 +34,14 @@ from ..presets import DEFAULT_PRESET, PRESETS
 from ..probe import PROBES, ProbePose, skin_offsets
 
 NP_PER_DB = 1 / 8.686
+# soft-tissue reference for the lesion attenuation that is path-averaged (glandular ~0.75 dB/cm/MHz)
+LESION_REF_ALPHA = 0.75 * 100 / 8.686
+# lesion masks at imaging resolution: lesion fraction across the elevation beam >= 0.5, then opening /
+# closing with a disc of the lateral PSF size (sub-resolution spicule fringe, fuzz, dotted cuts removed;
+# visible lobulation / spicules kept), components < MASK_MIN_MM2 dropped, holes filled (outline of the
+# visible lesion, as a radiologist draws it)
+MASK_PSF_MM = 0.4
+MASK_MIN_MM2 = 1.0
 C0 = 1540.0                       # speed of sound assumed by the beamformer, m/s
 
 
@@ -229,10 +237,18 @@ class PreviewRenderer:
         clut[tissue.BACKGROUND] = 1500.0
         self.c_lut = torch.from_numpy(clut).to(self.device)
         alpha = lesion_alpha(vol)
+        # a lesion's attenuation above soft tissue (posterior shadowing) is applied as a loss along the
+        # transmit / receive element paths (beam.BeamModel, like boundary losses), so its shadow has the
+        # beam-width edges of a real shadow instead of the hard per-line edge of a vertical integral
+        excess = np.zeros_like(alpha, dtype=np.float32)
+        if vol.lesion_id is not None:
+            les = vol.lesion_id > 0
+            excess[les] = np.clip(alpha[les] - LESION_REF_ALPHA, 0, None)
+            alpha = alpha - excess
         self._labels = t(lab)[None, None]
         # backscatter amplitude factor per voxel (sub-voxel tissue mixture), on top of echo_lut[label]
         self._echo_mod = t(vol.echo_mod)[None, None] if vol.echo_mod is not None else None
-        self._props = torch.stack([t(alpha), t(c)])[None]                     # (1, 2, A, U, V)
+        self._props = torch.stack([t(alpha), t(c), t(excess)])[None]          # (1, 3, A, U, V)
         # smoothed tissue-impedance field: boundary normals for the angle dependence
         zs = self.z_lut[self._labels[0, 0].long()]
         k = _gauss_kernel(0.3 / vol.voxel_mm, self.device)
@@ -463,10 +479,47 @@ class PreviewRenderer:
             E = self._interp(A_lut, E_lut, A)
             inten += w * E * torch.exp(-torch.cumsum(loss, 0))
             att_only += w * E
-            bloss += w * loss
+            # lesion excess attenuation: two-way intensity loss at the centre frequency, path-averaged
+            ex = self._sample(self._props[:, 2:3], pts, "bilinear")[0]
+            bloss += w * (loss + 4 * ex * (spec.fc / 1e6) ** power * dz * 1e-3)
             a_mean += w * A
         return (torch.complex(out_re[:nz], out_im[:nz]), inten, a_mean, torch.complex(coh_re[:nz], coh_im[:nz]),
                 att_only, bloss)
+
+    def _visible_lesion_labels(self, lab, lf, px_x, px_z):
+        """Labels whose lesion pixels form the lesion outline at imaging resolution (MASK_PSF_MM, MASK_MIN_MM2):
+        pixels of the refined mask that were not lesion get the frame's main lesion label, lesion pixels
+        outside it get the nearest non-lesion label."""
+        from scipy import ndimage
+        les0 = self.lesion_lut[lab]
+        m = (lf >= 0.5).cpu().numpy()
+        if not m.any() and not bool(les0.any()):
+            return lab
+        ry, rx = max(1, round(MASK_PSF_MM / 2 / px_z)), max(1, round(MASK_PSF_MM / 2 / px_x))
+        yy, xx = np.mgrid[-ry:ry + 1, -rx:rx + 1]
+        disc = (yy / ry) ** 2 + (xx / rx) ** 2 <= 1
+        m = ndimage.binary_closing(ndimage.binary_opening(m, disc), disc)
+        comp, n = ndimage.label(m)
+        if n:
+            area = ndimage.sum(m, comp, range(1, n + 1)) * px_x * px_z
+            m = np.isin(comp, 1 + np.nonzero(area >= MASK_MIN_MM2)[0])
+            m = ndimage.binary_fill_holes(m)
+        lab_np = lab.cpu().numpy()
+        les_np = les0.cpu().numpy()
+        out = lab_np.copy()
+        drop = les_np & ~m
+        if drop.any():
+            if (~les_np).any():
+                _, (iy, ix) = ndimage.distance_transform_edt(les_np, return_indices=True)
+                out[drop] = lab_np[iy[drop], ix[drop]]
+            else:
+                out[drop] = tissue.FAT
+        add = m & ~les_np
+        if add.any():
+            vals, cnt = np.unique(lab_np[les_np], return_counts=True) if les_np.any() else (np.array([tissue.TUMOR]), [1])
+            main = vals[np.argmax(cnt)] if les_np.any() else tissue.TUMOR
+            out[add] = tissue.TUMOR if main == tissue.CALC else main
+        return torch.from_numpy(out).to(lab.device)
 
     # ------------------------------------------------------------- render
     @torch.no_grad()
@@ -508,11 +561,20 @@ class PreviewRenderer:
             lab_c = self._sample(self._labels, plane, "nearest")[0].long()
             # bone and air interiors are anechoic and sit behind total shadows: their extreme speeds
             # are clamped to the soft-tissue range for the delays rather than stretching the display
-            c_c = self._sample(self._props[:, 1:], plane, "bilinear")[0].clamp(1300.0, 1800.0)
+            c_c = self._sample(self._props[:, 1:2], plane, "bilinear")[0].clamp(1300.0, 1800.0)
 
             def sigma_y_lam(depth, lam):
                 """Two-way elevation beam: diffraction at focus (0.886 lam zf / h), geometric off focus."""
                 return torch.sqrt((0.886 * lam * zf / h_el) ** 2 + (h_el * (1 - depth / zf)) ** 2 / 2) / 2.355
+
+            # lesion fraction across the two-way elevation beam profile (partial volume of the slice)
+            sig_e = sigma_y_lam(z, lam0)[:, None]
+            lf = torch.zeros(nz, nx, device=dev)
+            tes = torch.linspace(-2, 2, 9, device=dev)
+            wes = torch.exp(-0.5 * tes ** 2)
+            for te, we in zip(tes, wes / wes.sum()):
+                pe = plane + (te * sig_e)[..., None] * e_el
+                lf += we * self.lesion_lut[self._sample(self._labels, pe, "nearest")[0].long()].float()
 
             # attenuation, boundary transmission and echoes across the elevation beam
             k2 = 4 * np.pi / lam0                                                     # 2k at fc, rad/mm
@@ -592,13 +654,15 @@ class PreviewRenderer:
             e2t = env2.t()
             env2 = (torch.gather(e2t, 1, idx - 1) * (1 - frac) + torch.gather(e2t, 1, idx) * frac).t()
             lab_c = torch.gather(lab_c.t(), 1, torch.where(frac < 0.5, idx - 1, idx)).t()
-            return env2, lab_c, ref, bm, lam_row
+            lft = lf.t()
+            lf = (torch.gather(lft, 1, idx - 1) * (1 - frac) + torch.gather(lft, 1, idx) * frac).t()
+            return env2, lab_c, ref, bm, lam_row, lf
 
         n_app = int(round(p.depth_mm / dz))
         angles = [np.radians(a) for a in (p.compound_deg or (0.0,))]
         frames = [frame(t) for t in angles]
         if len(frames) == 1:
-            env2, lab_c, ref, bm, lam_row = frames[0]
+            env2, lab_c, ref, bm, lam_row, lf_c = frames[0]
         else:
             # spatial compounding: each steered frame to the common (lateral, depth) grid, where the
             # line of display point (X, Z) starts at X - Z tan(theta) with range Z / cos(theta);
@@ -620,7 +684,7 @@ class PreviewRenderer:
                 cnt += inside
             env2 = (amp_sum / cnt.clamp(min=1e-6)) ** 2
             k0 = int(np.argmin(np.abs(angles)))
-            _, lab_c, ref, bm, lam_row = frames[k0]
+            _, lab_c, ref, bm, lam_row, lf_c = frames[k0]
             if abs(angles[k0]) > 1e-9:
                 t = angles[k0]
                 xs0 = x[None, :] - zc_app[:, None] * float(np.tan(t))
@@ -629,6 +693,7 @@ class PreviewRenderer:
                                 -1)[None]
                 lab_c = F.grid_sample(lab_c.float()[None, None], g, mode="nearest", padding_mode="border",
                                       align_corners=True)[0, 0].long()
+                lf_c = F.grid_sample(lf_c[None, None], g, mode="bilinear", padding_mode="border", align_corners=True)[0, 0]
 
         # scan conversion to the preset pixel grid: interpolate the envelope amplitude
         # (area-averaging intensity would smooth the speckle and break its statistics)
@@ -643,6 +708,8 @@ class PreviewRenderer:
                 amp = _conv_along(amp, _gauss_kernel(0.42 * ratio, dev), dim)
         env2 = _resize_axis(_resize_axis(amp, out_h, 0, "linear"), out_w, 1, "linear") ** 2
         lab_o = _resize_axis(_resize_axis(lab_c.float(), out_h, 0, "nearest"), out_w, 1, "nearest").long()
+        lf_o = _resize_axis(_resize_axis(lf_c, out_h, 0, "linear"), out_w, 1, "linear")
+        lab_o = self._visible_lesion_labels(lab_o, lf_o, width / out_w, p.depth_mm / out_h)
         self.last_raw = env2             # linear echo intensity on the output grid, before TGC
         # TGC is a function of receive time, i.e. of displayed depth
         z_out = (torch.arange(out_h, device=dev, dtype=torch.float32) + 0.5) * (p.depth_mm / out_h)

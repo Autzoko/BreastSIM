@@ -20,9 +20,21 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from breastsim import devices, phantom, tissue
+from breastsim import devices, phantom, realism, tissue
 from breastsim.probe import PROBES, ProbePose
 from breastsim.realtime.renderer import ImagingParams, PreviewRenderer
+
+
+def visible(gray, les, meta, bound):
+    """Main lesion component as conspicuous as real lesions (realism.conspicuity >= bound)."""
+    from scipy import ndimage as ndi
+    comp, k = ndi.label(les)
+    main = comp == 1 + int(np.argmax(ndi.sum(les, comp, range(1, k + 1))))
+    if main.sum() < 50:
+        return False
+    g = gray.astype(np.float32)
+    f = realism.lesion_features(g, main, realism.tissue_mask(g), meta["px_z_mm"])
+    return "contrast_sd" in f and realism.conspicuity(f) >= bound
 
 
 def main():
@@ -34,6 +46,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--every", type=int, default=1, help="use every k-th phantom (quick iterations)")
     ap.add_argument("--probe-set", default="{}", help="probe spec overrides for experiments (JSON), e.g. bandwidth")
+    ap.add_argument("--min-conspicuity", type=float, nargs="?", const=realism.CONSPICUITY_MIN, default=None,
+                    help="drop lesion frames whose main lesion is less conspicuous than real lesions "
+                         "(realism.conspicuity; default bound realism.CONSPICUITY_MIN)")
     ap.add_argument("--lesion-views", type=int, default=1, help="frames per lesion")
     ap.add_argument("--on-breast", type=float, default=0.0, metavar="MM",
                     help="normal views only where breast tissue (not just chest-wall muscle) extends at least MM "
@@ -58,7 +73,7 @@ def main():
     else:
         pids = [i.id for i in phantom.list_phantoms() if (i.source == "oat64" and i.id.endswith("l")) or i.source == "usct"]
     pids = pids[::args.every]
-    n = 0
+    n = n_hidden = 0
     with open(out / "meta.jsonl", "w") as meta_f:
         for pid in pids:
             vol = phantom.load(pid, log=lambda *a: None)
@@ -86,6 +101,9 @@ def main():
                 les = np.isin(lab, tissue.LESIONS)
                 if view == "lesion" and not les.any():
                     continue
+                if view == "lesion" and args.min_conspicuity is not None and not visible(img[..., 0], les, meta, args.min_conspicuity):
+                    n_hidden += 1
+                    continue
                 name = f"{n:05d}.png"
                 Image.fromarray(img[..., 0]).save(out / "img" / name)
                 Image.fromarray((les * 255).astype(np.uint8)).save(out / "lesion" / name)
@@ -100,7 +118,8 @@ def main():
                                              **({f"lesion_{k}": les_t["recipe"][k] for k in ("case", "echo", "margin", "key")}
                                                 if les_t and "recipe" in les_t else {}))) + "\n")
                 n += 1
-        print(f"{n} frames -> {out}")
+        print(f"{n} frames -> {out}" + (f" ({n_hidden} lesion frames below the conspicuity bound dropped)"
+                                        if args.min_conspicuity is not None else ""))
 
 
 if __name__ == "__main__":

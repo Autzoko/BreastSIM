@@ -392,6 +392,17 @@ def lesion_features(g, les, valid, px_mm):
     return {k: float(x) for k, x in out.items()}
 
 
+# lesion conspicuity: interior contrast against the surrounding ring plus the boundary cue (gradient on the
+# mask edge above the ring's); real lesions are all visible (annotated by radiologists): the lower bound is
+# the 2nd percentile over BrEaST + BUSI lesions (src/scripts/lesion_visibility.py, 2026-10-27)
+CONSPICUITY_MIN = 0.25
+
+
+def conspicuity(t):
+    """Conspicuity of lesion feature rows (dict or DataFrame with contrast_sd, edge_sharpness)."""
+    return np.abs(t["contrast_sd"]) + np.maximum(t["edge_sharpness"] - 1.0, 0)
+
+
 def extract(samples, dataset, log=print):
     """Image and lesion feature tables of an iterable of samples."""
     imgs, lesions = [], []
