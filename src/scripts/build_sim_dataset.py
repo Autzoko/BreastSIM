@@ -15,7 +15,9 @@ e.g. USCT B / C, whose lesions lie 39-44 mm below the skin straight above them);
 inside the field of view and onto the slice (elevation offset < 0.6 x lesion radius), and
 shallower placements are preferred (weight exp(-depth / depth_scale_mm)): the phantoms are pendant
 (prone) breasts, so lesions straight below the highest skin point sit deeper than in supine
-clinical scans. After rendering the frame is kept only if the rendered tissue labels contain
+clinical scans. With plan --min-conspicuity a lesion view must be as conspicuous as real lesions
+(breastsim.realism.conspicuity); inconspicuous views are redrawn and counted per lesion echo type (shard attrs
+"visibility"). After rendering the frame is kept only if the rendered tissue labels contain
 lesion pixels (area >= --min-area mm2, after dropping components < 1/4 of the largest: detached
 sub-resolution mass fragments); normal frames must contain none. Frames with more than 2 %
 background (probe off the breast) are redrawn.
@@ -59,10 +61,13 @@ def cmd_plan(a):
     les = lesion_phantoms(ids)
     n_pos = int(round(a.n * a.pos_frac))
     frames = []
-    present = {s: w for s, w in SOURCES.items() if any(p.split("/")[0] == s for p in les)}
+    import fnmatch
+    shares = json.loads(a.shares) if a.shares else {f"{k}/*": v for k, v in SOURCES.items()}
+    group = lambda pid: next((g for g in shares if fnmatch.fnmatch(pid, g)), None)   # first matching pattern
+    present = {g: w for g, w in shares.items() if any(group(p) == g for p in les)}
     for src, share in present.items():
         share /= sum(present.values())      # a plan may cover only some sources (dataset built in parts)
-        pids = [p for p in les if p.split("/")[0] == src]
+        pids = [p for p in les if group(p) == src]
         per = np.full(len(pids), int(n_pos * share) // len(pids))
         per[:int(n_pos * share) - per.sum()] += 1
         for pid, k in zip(pids, per):
@@ -81,7 +86,7 @@ def cmd_plan(a):
                 k: v for k, v in d["params"].items() if k != "probe"}
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    plan = dict(preset=a.preset, seed=a.seed, devices=a.devices, min_area_mm2=a.min_area, depth_scale_mm=a.depth_scale,
+    plan = dict(preset=a.preset, seed=a.seed, devices=a.devices, shares=shares, min_conspicuity=a.min_conspicuity, min_area_mm2=a.min_area, depth_scale_mm=a.depth_scale,
                 n=a.n, pos_frac=a.pos_frac, frames=frames)
     (out / "plan.json").write_text(json.dumps(plan))
     by = {}
@@ -130,6 +135,28 @@ def normal_pose(vol, rng):
     return ProbePose(u=float(iu[j] * vol.voxel_mm), v=float(iv[j] * vol.voxel_mm),
                      rotation=float(rng.uniform(-180, 180)), tilt=float(rng.uniform(-12, 12)),
                      rock=float(rng.uniform(-12, 12)))
+
+
+def conspicuous(img, les, px_mm, bound):
+    """Main lesion component at least as conspicuous as real lesions (realism.conspicuity >= bound; as
+    render_benchmark_set.visible)."""
+    from breastsim import realism
+    from scipy import ndimage
+    comp, k = ndimage.label(les)
+    main = comp == 1 + int(np.argmax(ndimage.sum(les, comp, range(1, k + 1))))
+    if main.sum() < 50:
+        return False
+    g = img.astype(np.float32)
+    f = realism.lesion_features(g, main, realism.tissue_mask(g), px_mm)
+    return "contrast_sd" in f and bool(realism.conspicuity(f) >= bound)
+
+
+RECIPE_KEYS = ("case", "pathology", "echo", "shape", "margin", "posterior", "halo", "calc")
+
+
+def recipe_type(les):
+    r = les.get("recipe") or {}
+    return {k: r.get(k) for k in RECIPE_KEYS if k in r}
 
 
 def clean_mask(les):
@@ -188,6 +215,11 @@ def cmd_render(a):
     todo = [f for f in frames if f["idx"] not in done]
     print(f"shard {a.shard}/{a.shards}: {len(frames)} frames, {len(todo)} to render", flush=True)
     vol_id, t0, n_new, tries = None, time.time(), 0, 0
+    bound = plan.get("min_conspicuity")
+    if bound is not None and bound < 0:
+        from breastsim import realism
+        bound = realism.CONSPICUITY_MIN
+    hidden, dropped = {}, {}     # per lesion echo type: inconspicuous views redrawn / frames given up
     for f in todo:
         if f["phantom"] != vol_id:
             vol = phantom.load(f["phantom"], log=lambda *m: None)
@@ -207,14 +239,22 @@ def cmd_render(a):
             area = les.sum() * meta["px_x_mm"] * meta["px_z_mm"]
             ok = (lab == tissue.BACKGROUND).mean() <= 0.02 and (
                 area >= plan["min_area_mm2"] if f["view"] == "lesion" else area == 0)
+            if ok and f["view"] == "lesion" and bound is not None and not conspicuous(img, les, meta["px_z_mm"], bound):
+                t = recipe_type(lesions[f["lesion"]]).get("echo", "?")
+                hidden[t] = hidden.get(t, 0) + 1
+                ok = False
             if ok:
                 res = (img, les, lab, meta, pose, attempt)
                 break
         if res is None:
             print(f"  frame {f['idx']} ({f['phantom']} {f['view']} {f['lesion']}): no valid pose", flush=True)
+            if f["view"] == "lesion":
+                t = recipe_type(lesions[f["lesion"]]).get("echo", "?")
+                dropped[t] = dropped.get(t, 0) + 1
             continue
         img, les, lab, meta, pose, attempt = res
         m = dict(f, pose=pose.to_dict(), attempts=attempt + 1, px_mm=meta["px_z_mm"],
+                 **({"recipe": recipe_type(lesions[f["lesion"]])} if f["view"] == "lesion" else {}),
                  lesion_types=meta["lesion_types"], skin_offset_mm=meta["skin_offset_mm"],
                  **frame_stats(img, les, meta["px_z_mm"]))
         n = f5["img"].shape[0]
@@ -227,8 +267,11 @@ def cmd_render(a):
             f5.flush()
             dt = time.time() - t0
             print(f"  {n_new}/{len(todo)} frames, {dt / n_new:.2f} s/frame, {tries / n_new:.2f} renders/frame", flush=True)
+    f5.attrs["visibility"] = json.dumps({"bound": bound, "redrawn_views": hidden, "dropped_frames": dropped,
+                                         "previous": json.loads(f5.attrs.get("visibility", "{}"))})
     f5.close()
-    print(f"shard {a.shard}: +{n_new} frames in {time.time() - t0:.0f} s", flush=True)
+    print(f"shard {a.shard}: +{n_new} frames in {time.time() - t0:.0f} s; inconspicuous views redrawn per echo type "
+          f"{hidden}, frames dropped {dropped}", flush=True)
 
 
 def cmd_sheet(a):
@@ -283,15 +326,24 @@ def cmd_export_realism(a):
 def cmd_stats(a):
     """Dataset statistics over all shards of the given directories (counts, lesion size / shape / depth, gray)."""
     import collections
-    M = []
+    M, vis = [], []
     for d in a.out:
         for sh in sorted(Path(d).glob("shard_*.h5")):
             with h5py.File(sh, "r") as f5:
                 M += [json.loads(m) for m in f5["meta"][:]]
+                vis.append(json.loads(f5.attrs.get("visibility", "{}")))
     pct = lambda v: " / ".join(f"{x:.1f}" for x in np.percentile(v, [5, 25, 50, 75, 95]))
     src = lambda m: m["phantom"].split("/")[0]
     print(f"{len(M)} frames; by source/view: {dict(collections.Counter(src(m) + ':' + m['view'] for m in M))}")
     print(f"phantoms: {len({m['phantom'] for m in M})}, lesion phantoms: {len({m['phantom'] for m in M if m['view'] == 'lesion'})}")
+    L = [m for m in M if m["view"] == "lesion" and "recipe" in m]
+    if L:
+        print(f"recipe echo: {dict(collections.Counter(m['recipe'].get('echo') for m in L))}; pathology: "
+              f"{dict(collections.Counter(m['recipe'].get('pathology') for m in L))}")
+    tot = lambda key: dict(sum((collections.Counter(v.get(key, {})) for v in vis), collections.Counter()))
+    if any(v.get("bound") is not None for v in vis):
+        print(f"visibility bound {vis[0].get('bound')}: inconspicuous views redrawn {tot('redrawn_views')}, "
+              f"frames dropped {tot('dropped_frames')}")
     for name, sel in [("all", lambda m: True)] + [(k, lambda m, k=k: src(m) == k) for k in ("oat64", "usct", "victre")]:
         L = [m for m in M if m["view"] == "lesion" and sel(m)]
         if not L:
@@ -322,6 +374,11 @@ def main():
     pl.add_argument("--depth-scale", type=float, default=12.0, help="mm, preference for shallow lesion placements")
     pl.add_argument("--seed", type=int, default=0)
     pl.add_argument("--devices", action="store_true", help="draw a virtual device per frame (breastsim.devices)")
+    pl.add_argument("--shares", help='lesion-frame share per phantom-id pattern (JSON, fnmatch, first match), '
+                                     'e.g. \'{"oat64/*": 0.35, "victre/typ_*": 0.3}\'; default: SOURCES by source')
+    pl.add_argument("--min-conspicuity", type=float, nargs="?", const=-1.0, default=None,
+                    help="lesion views must be as conspicuous as real lesions (breastsim.realism.conspicuity); "
+                         "without a value: realism.CONSPICUITY_MIN")
     rd = sub.add_parser("render")
     rd.add_argument("--out", required=True)
     rd.add_argument("--shard", type=int, default=0)
