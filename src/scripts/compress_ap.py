@@ -12,7 +12,8 @@ folder is written. Model (VICTRE breastCompress's own materials and contact, see
   20 kPa (breastCompress.cxx); muscle elements fixed (chest wall);
 - a rigid plate (ABUS membrane / probe face) above the nipple, frictionless facet-to-facet sliding contact,
   moved toward the chest wall until the nipple-to-muscle distance is --thickness mm; FEBio (src/docker/febio).
-- the nodal displacement field is put on a grid, inverted by fixed-point iteration X = x - u(X), and every
+- the nodal displacement field (on the hex lattice) is inverted by fixed-point iteration X = x - u(X) on that
+  lattice, X is interpolated to the voxels, and every
   label volume is resampled (nearest) at X: all tissues, ligaments and lesions move with the same field, so
   lesion masks stay exact; lesion centres in insertion.json are mapped forward.
 """
@@ -149,45 +150,77 @@ def plate_mesh(lo, hi, x0, step=4.0, t=1.0):
 
 def read_disp(path, n_plate, n_nodes):
     """Last record of the FEBio node_data log: rows 'id ux uy uz' for every node."""
-    rows = [l.split() for l in Path(path).read_text().splitlines() if l and l[0].isdigit()]
-    last = np.array([[float(x) for x in r] for r in rows[-(n_plate + n_nodes):]])
-    return last[n_plate:, 1:4]
+    txt = Path(path).read_text()
+    last = txt[txt.rfind("*Data"):].split("\n", 1)[1]                    # block of the final step
+    a = np.loadtxt(last.splitlines()[:n_plate + n_nodes])
+    return a[n_plate:, 1:4]
 
 
-def inverse_resample(labs, vox, nodes, disp, grid_mm, iters=20):
-    """Labels at X with X + u(X) = x for every output voxel x (same array frame, axis 0 = AP)."""
+def inverse_resample(labs, vox, nodes, disp, grid_mm, iters=20, full=False, device="cpu", solve_mm=0.5):
+    """Labels at X with X + u(X) = x for every output voxel x (same array frame, axis 0 = AP).
+
+    The fixed point X = x - u(X) is solved on a solve_mm grid and X is interpolated (trilinear) to the voxels
+    (the inverse map is as smooth as u); full=True iterates at every voxel instead (slow reference)."""
     import torch
     import torch.nn.functional as F
-    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
     shape = labs[0].shape
     ext = np.array(shape) * vox
+    # the hex mesh nodes lie on a regular grid_mm lattice: the displacement is that lattice (trilinear inside
+    # the elements, as the hex8 shape functions), extended outside the tissue by its nearest node
     gs = [np.arange(0, e + grid_mm, grid_mm) for e in ext]
-    G = np.stack(np.meshgrid(*gs, indexing="ij"), -1).reshape(-1, 3)
-    lin = LinearNDInterpolator(nodes, disp)
-    u = lin(G)
-    bad = ~np.isfinite(u[:, 0])
-    u[bad] = NearestNDInterpolator(nodes, disp)(G[bad])
-    ug = torch.from_numpy(u.reshape(*[len(g) for g in gs], 3).transpose(3, 0, 1, 2).copy()).float()[None]
+    lat = np.round(nodes / grid_mm).astype(int)
+    U = np.full((*[len(g) for g in gs], 3), np.nan, np.float32)
+    ok = (lat >= 0).all(1) & (lat < [len(g) for g in gs]).all(1)
+    U[lat[ok, 0], lat[ok, 1], lat[ok, 2]] = disp[ok]
+    miss = np.isnan(U[..., 0])
+    _, ind = ndimage.distance_transform_edt(miss, return_indices=True)
+    U = U[ind[0], ind[1], ind[2]]
+    gsol = [np.arange(0, e + solve_mm, solve_mm) for e in ext]
+    G = np.stack(np.meshgrid(*gsol, indexing="ij"), -1)
+    smax = torch.tensor([g[-1] for g in gsol], dtype=torch.float32, device=device)
+    ug = torch.from_numpy(U.transpose(3, 0, 1, 2).copy()).float()[None]
+    dev = torch.device(device)
+    ug = ug.to(dev)
     outs = [np.zeros(shape, np.uint8) for _ in labs]
-    srcs = [torch.from_numpy(l.astype(np.float32))[None, None] for l in labs]
-    gmax = torch.tensor([g[-1] for g in gs], dtype=torch.float32)
-    lmax = torch.tensor([(n - 1) * vox for n in shape], dtype=torch.float32)
-    b = np.arange(shape[1]) * vox
-    c = np.arange(shape[2]) * vox
-    for a0 in range(0, shape[0], 16):
-        a = np.arange(a0, min(a0 + 16, shape[0])) * vox
-        x = torch.from_numpy(np.stack(np.meshgrid(a, b, c, indexing="ij"), -1)).float()     # (na, nb, nc, 3)
+    srcs = [torch.from_numpy(l).to(dev)[None, None] for l in labs]                    # uint8 on the device
+    gmax = torch.tensor([g[-1] for g in gs], dtype=torch.float32, device=dev)
+    lmax = torch.tensor([(n - 1) * vox for n in shape], dtype=torch.float32, device=dev)
+
+    def solve(x):                                                                     # fixed point at points x
         X = x.clone()
         for _ in range(iters):
-            g = (X / gmax * 2 - 1).flip(-1)[None]                                            # grid_sample (w, h, d)
+            g = (X / gmax * 2 - 1).flip(-1)[None]                                        # grid_sample (w, h, d)
             uX = F.grid_sample(ug, g, mode="bilinear", padding_mode="border", align_corners=True)[0]
             X = x - uX.permute(1, 2, 3, 0)
+        return X
+
+    if not full:
+        Gt = torch.from_numpy(G).float().to(dev)
+        Xg = solve(Gt).permute(3, 0, 1, 2)[None]                                          # (1, 3, *grid)
+    b = torch.arange(shape[1], device=dev, dtype=torch.float32) * vox
+    c = torch.arange(shape[2], device=dev, dtype=torch.float32) * vox
+    step = 16 if full else 32
+    for a0 in range(0, shape[0], step):
+        a = torch.arange(a0, min(a0 + step, shape[0]), device=dev, dtype=torch.float32) * vox
+        x = torch.stack(torch.meshgrid(a, b, c, indexing="ij"), -1)                       # (na, nb, nc, 3)
+        if full:
+            X = solve(x)
+        else:
+            g = (x / smax * 2 - 1).flip(-1)[None]
+            X = F.grid_sample(Xg, g, mode="bilinear", padding_mode="border", align_corners=True)[0].permute(1, 2, 3, 0)
         inside = ((X >= 0) & (X <= lmax)).all(-1)
-        g = (X / lmax * 2 - 1).flip(-1)[None]
+        idx = torch.round(X / vox).long()
+        for d in range(3):
+            idx[..., d].clamp_(0, shape[d] - 1)
         for src, out in zip(srcs, outs):
-            v = F.grid_sample(src, g, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0]
-            out[a0:a0 + len(a)] = np.where(inside.numpy(), v.numpy(), 0).astype(np.uint8)
-    return outs, (lin, NearestNDInterpolator(nodes, disp))
+            v = src[0, 0][idx[..., 0], idx[..., 1], idx[..., 2]]
+            out[a0:a0 + len(a)] = torch.where(inside, v, torch.zeros_like(v)).cpu().numpy()
+    def forward(p):                                                                   # u at points p (mm)
+        g = torch.from_numpy((np.asarray(p, np.float64) / np.array([g[-1] for g in gs]) * 2 - 1)[:, ::-1]
+                             .astype(np.float32).copy())
+        return F.grid_sample(ug.cpu(), g.reshape(1, -1, 1, 1, 3), mode="bilinear", padding_mode="border",
+                             align_corners=True)[0, :, :, 0, 0].T.numpy()
+    return outs, forward
 
 
 def main():
@@ -200,6 +233,8 @@ def main():
     ap.add_argument("--lateral-pad-mm", type=float, default=15.0, help="room for the lateral expansion")
     ap.add_argument("--image", default="breastsim/febio")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--device", default="cpu", help="torch device for the resampling (cpu / cuda)")
+    ap.add_argument("--full-inverse", action="store_true", help="fixed point at every voxel (slow reference)")
     a = ap.parse_args()
     t0 = time.time()
     src, dst = Path(a.src) / str(a.seed), Path(a.dst) / str(a.seed)
@@ -248,7 +283,11 @@ def main():
         raise SystemExit(f"FEBio did not terminate normally, see {work}/model.log")
     u = read_disp(work / "disp.txt", len(pn), len(nodes))
     t2 = time.time()
-    outs, (lin, near) = inverse_resample(W, vox, nodes, u, grid_mm=1.0)
+    t3 = time.time()
+    outs, forward = inverse_resample(W, vox, nodes, u, grid_mm=max(1, int(round(a.mesh_mm / vox))) * vox,
+                                     full=a.full_inverse, device=a.device)
+    print(f"[compress] resampling {time.time() - t3:.0f} s ({'full' if a.full_inverse else 'grid'} inverse, {a.device})",
+          flush=True)
     # back to the source orientation and size (the lateral padding stays: the breast widens)
     back = lambda v: (v[::-1] if high else v).transpose(np.argsort(perm))
     shp = None
@@ -275,8 +314,7 @@ def main():
             if high:
                 cw[0] = lab.shape[axis] - 1 - cw[0]
             cw = cw * vox + [0, pad * vox, pad * vox]
-            d = lin(cw[None])[0]
-            cw2 = cw + (d if np.isfinite(d).all() else near(cw[None])[0])
+            cw2 = cw + forward(cw[None])[0]
             cw2 = cw2 / vox
             if high:
                 cw2[0] = lab.shape[axis] - 1 - cw2[0]
