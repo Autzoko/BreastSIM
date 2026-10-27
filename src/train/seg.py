@@ -128,6 +128,12 @@ def predict(model, img, dev, bs=64):
     return np.concatenate(out)
 
 
+def per_image_dice(pred, mask):
+    m = mask.astype(bool)
+    inter, tot = (pred & m).sum((1, 2)), pred.sum((1, 2)) + m.sum((1, 2))
+    return np.where(tot > 0, 2 * inter / np.maximum(tot, 1), 1.0)
+
+
 def metrics(pred, mask):
     m = mask.astype(bool)
     inter = (pred & m).sum((1, 2))
@@ -232,8 +238,10 @@ def cmd_finetune(a):
         return
     log = train(model, x, y, out, a.iters, dev, seed=a.seed, log_every=a.iters)
     test_i, test_m, _ = load_real(a.real, "test")
+    pred = predict(model, test_i, dev)
     res = dict(dataset=Path(a.real).stem, init=a.init_name or a.init, n_train=len(sel), seed=a.seed,
-               iters=a.iters, **metrics(predict(model, test_i, dev), test_m), loss=log[-1]["loss"])
+               iters=a.iters, **metrics(pred, test_m), loss=log[-1]["loss"],
+               dice_per_image=per_image_dice(pred, test_m).round(4).tolist())
     (out / "result.json").write_text(json.dumps(res))
     (out / "ckpt.pt").unlink(missing_ok=True)          # keep only the final weights
     if not a.keep:
@@ -250,7 +258,8 @@ def cmd_evaluate(a):
     for p in a.real:
         for split in a.splits.split(","):
             i, m, _ = load_real(p, split)
-            res[f"{Path(p).stem}/{split}"] = metrics(predict(model, i, dev), m)
+            pred = predict(model, i, dev)
+            res[f"{Path(p).stem}/{split}"] = {**metrics(pred, m), "dice_per_image": per_image_dice(pred, m).round(4).tolist()}
     print(json.dumps(res, indent=1))
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=1))
@@ -273,6 +282,38 @@ def cmd_summary(a):
             d, u = np.array([r["dice"] for r in rs]), np.array([r["iou"] for r in rs])
             cells.append(f"{d.mean():.3f}+-{d.std():.3f} / {u.mean():.3f} (n={len(rs)})" if rs else "-")
         print(f"| {ds} | {n} | " + " | ".join(cells) + " |")
+
+
+def cmd_breakdown(a):
+    """Mean Dice per lesion group (meta "pathology", "cystic") for fine-tuning runs (--ft, test split) and/or
+    zero-shot evaluations (--zeroshot JSON from `evaluate`; every split it holds: no real image was trained on)."""
+    import collections
+    groups = {}
+    for p in a.real:
+        with h5py.File(p, "r") as f:
+            for split in ("train", "test"):
+                sel = f["split"][:] == split.encode()
+                groups[(Path(p).stem, split)] = [json.loads(m) for m, s in zip(f["meta"][:], sel) if s]
+    keyf = {"pathology": lambda m: m.get("pathology"), "cystic": lambda m: {True: "cystic", False: "solid"}.get(m.get("cystic"))}
+    rows = collections.defaultdict(list)
+    runs = [json.loads(f.read_text()) for f in Path(a.ft).glob("*/result.json")] if a.ft else []
+    for z in a.zeroshot or []:
+        for k, v in json.loads(Path(z).read_text()).items():
+            ds, split = k.split("/")
+            runs.append(dict(dataset=ds, split=split, init=f"zeroshot:{Path(z).stem}", n_train=0,
+                             dice_per_image=v["dice_per_image"]))
+    for r in runs:
+        key = (r["dataset"], r.get("split", "test"))
+        if key not in groups or "dice_per_image" not in r:
+            continue
+        for kname, kf in keyf.items():
+            for m, d in zip(groups[key], r["dice_per_image"]):
+                g = kf(m)
+                if g is not None:
+                    rows[(r["dataset"], kname, g, r["n_train"], r["init"])].append(d)
+    print("| dataset | group | n train | init | mean Dice | images x runs |\n|---|---|---|---|---|---|")
+    for (ds, kname, g, n, init), v in sorted(rows.items()):
+        print(f"| {ds} | {kname}={g} | {n} | {init} | {np.mean(v):.3f} | {len(v)} |")
 
 
 def main():
@@ -310,8 +351,12 @@ def main():
     e.add_argument("--out")
     m = sub.add_parser("summary")
     m.add_argument("--ft", required=True, help="directory of fine-tuning runs")
+    b = sub.add_parser("breakdown")
+    b.add_argument("--real", nargs="+", required=True)
+    b.add_argument("--ft")
+    b.add_argument("--zeroshot", nargs="*")
     a = ap.parse_args()
-    {"cache-sim": cmd_cache_sim, "pretrain": cmd_pretrain, "finetune": cmd_finetune, "evaluate": cmd_evaluate,
+    {"breakdown": cmd_breakdown, "cache-sim": cmd_cache_sim, "pretrain": cmd_pretrain, "finetune": cmd_finetune, "evaluate": cmd_evaluate,
      "summary": cmd_summary}[a.cmd](a)
 
 

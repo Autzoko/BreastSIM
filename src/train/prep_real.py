@@ -12,6 +12,9 @@ Gray (mean of RGB, as breastsim.realism reads them) and lesion mask resized to s
   TDSC-ABUS lesion plane of the 100 training volumes, 20 % of volumes test; each 154 mm sweep frame is cut
             to a 42 mm window (as the handheld images) at a random offset that contains the lesion
 Datasets: img (N, S, S) uint8, mask (N, S, S) uint8, split (N,) "train" | "test", meta (N,) JSON.
+Meta per image for breakdowns: "pathology" (benign / malignant: BUSI folder, BUS-BRA Pathology, BrEaST
+Classification, TDSC-ABUS label) and "cystic" (BUS-BRA histology "cyst"; BrEaST echogenicity "anechoic" or
+"complex cystic/solid"; None where the dataset has no such annotation).
 """
 import argparse
 import json
@@ -57,6 +60,9 @@ def main():
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     folds = pd.read_csv(paths.REAL / "busbra/BUSBRA/5-fold-cv.csv").set_index("ID").kFold
+    histology = pd.read_csv(paths.REAL / "busbra/BUSBRA/bus_data.csv").set_index("ID").Histology.str.lower()
+    breast_x = pd.read_excel(next((paths.REAL / "breast_lesions_usg").glob("BrEaST-Lesions-USG-clinical-data-*.xlsx")))
+    echogenicity = breast_x.set_index(breast_x.Image_filename.str.replace(".png", "", regex=False)).Echogenicity
     for name in a.datasets.split(","):
         rows = []
         rng = np.random.default_rng(a.seed)
@@ -72,6 +78,10 @@ def main():
                              meta=dict(id=str(s["id"]), case=group_of(name, s), img_shape=list(g.shape),
                                        px_mm=s["px_mm"], lesion_frac=round(float(s["lesion"].mean()), 4),
                                        **{k: str(v) for k, v in s["info"].items()})))
+            m = rows[-1]["meta"]
+            m["pathology"] = m.get("group")
+            m["cystic"] = (histology.get(m["case"]) == "cyst" if name == "BUS-BRA" else
+                           echogenicity.get(m["case"]) in ("anechoic", "complex cystic/solid") if name == "BrEaST" else None)
         rng = np.random.default_rng(a.seed)
         if name == "BUS-BRA":
             test = {r["meta"]["case"] for r in rows if folds.get(r["meta"]["case"]) == 1}
