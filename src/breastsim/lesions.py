@@ -38,9 +38,13 @@ TYPES_FILE = Path(__file__).with_name("lesion_types.json")
 # posterior feature; src/scripts/lesion_calibrate.py, 2026-10-27). Monotonic.
 CONTRAST_CURVE = {"ratio": [0.05, 0.1, 0.2, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0],
                   "contrast_sd": [-2.638, -2.488, -2.051, -1.497, -1.066, -0.625, -0.161, 0.379, 0.962]}
-# fluid (cystic core): ratio at the median rendered contrast of real anechoic BrEaST lesions (-2.05 -> ~0.13;
-# real cysts are not black: clutter / noise fill them)
-FLUID_RATIO = 0.13
+# fluid (anechoic lesions, cystic parts): almost no scatterers - what fills a cyst on the image is the imaging
+# chain (sidelobes, clutter, receive noise), as in real cysts. 0.13 (the solid-lesion contrast curve read at the
+# real anechoic median) rendered large typed cysts at contrast_sd -1.25 vs real -2.05 (BrEaST anechoic, n=15) /
+# -1.66 (BUS-BRA histology "cyst", n=142); 0.07 gave -2.60 and 0.02 (no scatterers) -2.98 (30 views of 3 large
+# cysts each, t3c sets): real scanners fill cysts with more clutter / reverberation than the simulated chain, so the
+# fluid level is calibrated, log-interpolated (0.07 - 0.13) to the mean of the two real medians (-1.85).
+FLUID_RATIO = 0.10
 CYSTIC_CORE_FRACTION = 0.4
 TRANSITION_MM = 0.4            # 0.8 mm gave edge_sharpness 0.99 vs real 1.16-1.29 (non-circumscribed)
 HALO_REL_WIDTH = 0.15           # realism.lesion_features measures the halo over 0.15 x diameter
@@ -96,6 +100,8 @@ def mass_kind(r):
 def echo_ratio(r):
     if r.get("echo_ratio") is not None:          # explicit (calibration)
         return float(r["echo_ratio"])
+    if r["echo"] == "anechoic":
+        return FLUID_RATIO
     c = r.get("contrast_sd")
     if c is None:
         c = {"hypoechoic": -0.9, "heterogeneous": -0.5, "isoechoic": -0.45, "hyperechoic": 0.3,

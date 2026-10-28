@@ -87,9 +87,9 @@ def write_feb(path, nodes, ele, mats, face, fixed, plate, disp, steps=20):
     pn, ph = plate
     L = ['<?xml version="1.0" encoding="ISO-8859-1"?>', '<febio_spec version="2.0">', '\t<Module type="solid"/>',
          "\t<Control>", f"\t\t<time_steps>{steps}</time_steps>", f"\t\t<step_size>{1 / steps}</step_size>",
-         "\t\t<max_refs>15</max_refs>", "\t\t<max_ups>10</max_ups>", "\t\t<dtol>0.001</dtol>", "\t\t<etol>0.01</etol>",
+         "\t\t<max_refs>25</max_refs>", "\t\t<max_ups>10</max_ups>", "\t\t<dtol>0.001</dtol>", "\t\t<etol>0.01</etol>",
          "\t\t<rtol>0</rtol>", "\t\t<lstol>0.9</lstol>", "\t\t<time_stepper>", f"\t\t\t<dtmin>{0.02 / steps}</dtmin>",
-         f"\t\t\t<dtmax>{1 / steps}</dtmax>", "\t\t\t<max_retries>10</max_retries>", "\t\t\t<opt_iter>10</opt_iter>",
+         f"\t\t\t<dtmax>{1 / steps}</dtmax>", "\t\t\t<max_retries>20</max_retries>", "\t\t\t<opt_iter>10</opt_iter>",
          "\t\t</time_stepper>", '\t\t<analysis type="static"/>', "\t</Control>", "\t<Material>"]
     for i, (name, e) in enumerate((("fat", E_KPA["fat"]), ("gland", E_KPA["gland"]), ("mass", E_KPA["mass"])), 1):
         L += [f'\t\t<material id="{i}" name="{name}" type="neo-Hookean">', "\t\t\t<density>1e-06</density>",
@@ -151,9 +151,11 @@ def plate_mesh(lo, hi, x0, step=4.0, t=1.0):
 def read_disp(path, n_plate, n_nodes):
     """Last record of the FEBio node_data log: rows 'id ux uy uz' for every node."""
     txt = Path(path).read_text()
-    last = txt[txt.rfind("*Data"):].split("\n", 1)[1]                    # block of the final step
+    k = txt.rfind("*Data")
+    t = float(txt[txt.rfind("*Time", 0, k):k].split("=")[1])            # time (load fraction) of that step
+    last = txt[k:].split("\n", 1)[1]                                    # block of the final converged step
     a = np.loadtxt(last.splitlines()[:n_plate + n_nodes])
-    return a[n_plate:, 1:4]
+    return a[n_plate:, 1:4], t
 
 
 def inverse_resample(labs, vox, nodes, disp, grid_mm, iters=20, full=False, device="cpu", solve_mm=0.5):
@@ -233,6 +235,8 @@ def main():
     ap.add_argument("--lateral-pad-mm", type=float, default=15.0, help="room for the lateral expansion")
     ap.add_argument("--image", default="breastsim/febio")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--steps", type=int, default=20, help="FEBio time steps (more for stiff / dense phantoms)")
+    ap.add_argument("--min-fraction", type=float, default=0.6, help="accept a run that stopped after this load fraction")
     ap.add_argument("--device", default="cpu", help="torch device for the resampling (cpu / cuda)")
     ap.add_argument("--full-inverse", action="store_true", help="fixed point at every voxel (slow reference)")
     a = ap.parse_args()
@@ -270,18 +274,27 @@ def main():
           f"(fat {int((ecls == 1).sum())}, gland {int((ecls == 2).sum())}, mass {int((ecls == 3).sum())}, "
           f"muscle {int((ecls == 4).sum())}), {len(face)} contact faces", flush=True)
     lo, hi = nodes[:, 1:].min(0) - 10, nodes[:, 1:].max(0) + 10
-    pn, ph = plate_mesh(lo, hi, nodes[:, 0].max() + 0.5)
-    write_feb(work / "model.feb", nodes, ele, mats, face, fixed, (pn, ph), disp)
+    # plate just above the apex: with a gap larger than one load step the first steps carry no load and FEBio's
+    # relative energy / displacement norms on a ~1e-20 residual never converge ("max nr of reformations")
+    pn, ph = plate_mesh(lo, hi, nodes[:, 0].max() + 0.05)
     t1 = time.time()
     done = lambda: (work / "model.log").exists() and "N O R M A L   T E R M I N A T I O N" in (work / "model.log").read_text()
-    if not done():                                         # (a finished run in this folder is reused)
+    reached = 1.0 if done() else 0.0                       # (a finished run in this folder is reused)
+    for steps in ([] if done() else [a.steps, 2 * a.steps]):
+        # contact runs can diverge at the first step or invert an element late in the load; a second attempt
+        # with half the step size, then the last converged state if the plate travelled >= --min-fraction
+        write_feb(work / "model.feb", nodes, ele, mats, face, fixed, (pn, ph), disp, steps=steps)
         r = subprocess.run(["docker", "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}", "-e",
                             f"OMP_NUM_THREADS={a.threads}", "--cpus", str(a.threads), "-v", f"{work.resolve()}:/work",
                             "-w", "/work", a.image, "febio4", "-i", "model.feb", "-silent"], capture_output=True, text=True)
         (work / "febio_stdout.txt").write_text(r.stdout + r.stderr)
-    if not done():
-        raise SystemExit(f"FEBio did not terminate normally, see {work}/model.log")
-    u = read_disp(work / "disp.txt", len(pn), len(nodes))
+        reached = 1.0 if done() else read_disp(work / "disp.txt", len(pn), len(nodes))[1]
+        print(f"[compress] FEBio ({steps} steps): load reached {reached:.3f}", flush=True)
+        if reached >= 0.999:
+            break
+    if reached < a.min_fraction:
+        raise SystemExit(f"FEBio stopped at load {reached:.2f} (< {a.min_fraction}), see {work}/model.log")
+    u, _ = read_disp(work / "disp.txt", len(pn), len(nodes))
     t2 = time.time()
     t3 = time.time()
     outs, forward = inverse_resample(W, vox, nodes, u, grid_mm=max(1, int(round(a.mesh_mm / vox))) * vox,
@@ -302,6 +315,7 @@ def main():
         (dst / f"{n}.mhd").write_text("".join(f"{k} = {v}\n" for k, v in h.items()))
     gen = json.loads((src / "generation.json").read_text())
     gen["compression"] = {"source": str(src), "thickness_mm": a.thickness, "plate_displacement_mm": round(disp, 2),
+                          "load_reached": round(reached, 3), "plate_displacement_reached_mm": round(disp * reached, 2),
                           "mesh_mm": a.mesh_mm, "nodes": len(nodes), "tets": len(ele), "E_kPa": E_KPA, "nu": 0.49,
                           "lateral_pad_mm": a.lateral_pad_mm, "febio_seconds": round(t2 - t1, 1),
                           "total_seconds": round(time.time() - t0, 1)}
