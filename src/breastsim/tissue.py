@@ -124,9 +124,11 @@ POSTERIOR_FEATURE_PROBS = {
 # In vivo attenuation slopes of breast masses (Nam et al., UMB 2013, PMC3676873, 3-13 MHz, reference phantom
 # method): carcinomas 1.16 dB/cm/MHz (0.51-1.77, n=10), fibroadenomas 0.94 (0.37-1.63, n=14); the masses with
 # posterior shadowing are at the top of that range. 1.8-3.5 rendered complete, full-depth black columns behind
-# 10-15 mm masses (real shadows are partial).
+# 10-15 mm masses (real shadows are partial). Rendered posterior_sd (t6c25 / t6c20) vs BrEaST by annotated
+# feature: shadowing -0.66 / -0.52 vs -0.69; enhancement 0.88 / 1.37 vs 0.80; "combined" at 0.9-1.4 gave -1.2 /
+# -1.4 vs 0.0 (n=7) -> 0.7-1.1.
 POSTERIOR_ATTENUATION_DB_CM_MHZ = {
-    "shadowing": (1.3, 1.8), "combined": (0.9, 1.4), "none": (0.4, 0.8), "enhancement": (0.05, 0.3),
+    "shadowing": (1.3, 1.8), "combined": (0.7, 1.1), "none": (0.4, 0.8), "enhancement": (0.05, 0.3),
 }
 CYST_ATTENUATION_DB_CM_MHZ = (0.0, 0.05)        # fluid, whatever the drawn feature
 NP_PER_M_PER_DB_PER_CM = 100 / 8.686
