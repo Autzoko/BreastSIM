@@ -42,13 +42,14 @@ SOURCES = {   # source -> share of the lesion frames (split evenly over its phan
     "victre": 0.40, "oat64": 0.45, "usct": 0.15}
 
 
-def lesion_phantoms(ids):
+def lesion_phantoms(ids, with_keys=False):
+    """{phantom: [lesion id]} of lesions >= 3 mm; with_keys: {phantom: [(lesion id, recipe key or None)]}."""
     out = {}
     for pid in ids:
         meta = json.loads((phantom.cache_dir(pid) / "meta.json").read_text())
-        les = [l["id"] for l in meta["lesions"] if l["diameter_mm"] >= 3.0]
+        les = [(l["id"], (l.get("recipe") or {}).get("key")) for l in meta["lesions"] if l["diameter_mm"] >= 3.0]
         if les:
-            out[pid] = les
+            out[pid] = les if with_keys else [i for i, _ in les]
     return out
 
 
@@ -64,17 +65,39 @@ def cmd_plan(a):
     import fnmatch
     shares = json.loads(a.shares) if a.shares else {f"{k}/*": v for k, v in SOURCES.items()}
     group = lambda pid: next((g for g in shares if fnmatch.fnmatch(pid, g)), None)   # first matching pattern
-    present = {g: w for g, w in shares.items() if any(group(p) == g for p in les)}
-    for src, share in present.items():
-        share /= sum(present.values())      # a plan may cover only some sources (dataset built in parts)
-        pids = [p for p in les if group(p) == src]
-        per = np.full(len(pids), int(n_pos * share) // len(pids))
-        per[:int(n_pos * share) - per.sum()] += 1
-        for pid, k in zip(pids, per):
-            frames += [dict(phantom=pid, view="lesion", lesion=int(rng.choice(les[pid]))) for _ in range(k)]
-    while len(frames) < n_pos:      # rounding / missing sources: top up from all lesion phantoms
-        pid = list(les)[rng.integers(len(les))]
-        frames.append(dict(phantom=pid, view="lesion", lesion=int(rng.choice(les[pid]))))
+    if a.type_shares:
+        # lesion frames by recipe type (typed insertions, cache meta "recipe"): target shares from lesion_types.json
+        # types[].share (renormalised over the types present), each type's frames spread evenly over its lesions;
+        # only phantoms whose pattern share is > 0 contribute
+        from breastsim import lesions as lesion_types
+        target = {t["key"]: t["share"] for t in lesion_types.load_types()["types"]}
+        pool = {}
+        for pid, ls in lesion_phantoms([p for p in les if shares.get(group(p), 0) > 0], with_keys=True).items():
+            for lid, key in ls:
+                if key in target:
+                    pool.setdefault(key, []).append((pid, lid))
+        tot = sum(target[k] for k in pool)
+        keys = sorted(pool)
+        counts = {k: int(n_pos * target[k] / tot) for k in keys}
+        for k in keys[:n_pos - sum(counts.values())]:
+            counts[k] += 1
+        for k in keys:
+            order = rng.permutation(len(pool[k]))
+            frames += [dict(phantom=pool[k][order[j % len(order)]][0], view="lesion",
+                            lesion=int(pool[k][order[j % len(order)]][1]), type_key=k) for j in range(counts[k])]
+        print("lesion frames per type:", {k: (counts[k], len(pool[k])) for k in keys}, "(frames, lesions)")
+    else:
+        present = {g: w for g, w in shares.items() if w > 0 and any(group(p) == g for p in les)}
+        for src, share in present.items():
+            share /= sum(present.values())      # a plan may cover only some sources (dataset built in parts)
+            pids = [p for p in les if group(p) == src]
+            per = np.full(len(pids), int(n_pos * share) // len(pids))
+            per[:int(n_pos * share) - per.sum()] += 1
+            for pid, k in zip(pids, per):
+                frames += [dict(phantom=pid, view="lesion", lesion=int(rng.choice(les[pid]))) for _ in range(k)]
+        while len(frames) < n_pos:      # rounding / missing sources: top up from all lesion phantoms
+            pid = list(les)[rng.integers(len(les))]
+            frames.append(dict(phantom=pid, view="lesion", lesion=int(rng.choice(les[pid]))))
     for i in range(a.n - len(frames)):  # normal frames spread over every phantom
         frames.append(dict(phantom=ids[i % len(ids)], view="normal", lesion=-1))
     frames.sort(key=lambda f: f["phantom"])            # shards load each phantom once
@@ -86,7 +109,7 @@ def cmd_plan(a):
                 k: v for k, v in d["params"].items() if k != "probe"}
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    plan = dict(preset=a.preset, seed=a.seed, devices=a.devices, shares=shares, min_conspicuity=a.min_conspicuity, min_area_mm2=a.min_area, depth_scale_mm=a.depth_scale,
+    plan = dict(preset=a.preset, seed=a.seed, devices=a.devices, shares=shares, type_shares=a.type_shares, min_conspicuity=a.min_conspicuity, min_area_mm2=a.min_area, depth_scale_mm=a.depth_scale,
                 n=a.n, pos_frac=a.pos_frac, frames=frames)
     (out / "plan.json").write_text(json.dumps(plan))
     by = {}
@@ -151,7 +174,7 @@ def conspicuous(img, les, px_mm, bound):
     return "contrast_sd" in f and bool(realism.conspicuity(f) >= bound)
 
 
-RECIPE_KEYS = ("case", "pathology", "echo", "shape", "margin", "posterior", "halo", "calc")
+RECIPE_KEYS = ("case", "key", "pathology", "echo", "shape", "margin", "posterior", "halo", "calc")
 
 
 def recipe_type(les):
@@ -338,6 +361,7 @@ def cmd_stats(a):
     print(f"phantoms: {len({m['phantom'] for m in M})}, lesion phantoms: {len({m['phantom'] for m in M if m['view'] == 'lesion'})}")
     L = [m for m in M if m["view"] == "lesion" and "recipe" in m]
     if L:
+        print(f"recipe type: {dict(collections.Counter(m['recipe'].get('key') for m in L))}")
         print(f"recipe echo: {dict(collections.Counter(m['recipe'].get('echo') for m in L))}; pathology: "
               f"{dict(collections.Counter(m['recipe'].get('pathology') for m in L))}")
     tot = lambda key: dict(sum((collections.Counter(v.get(key, {})) for v in vis), collections.Counter()))
@@ -376,6 +400,8 @@ def main():
     pl.add_argument("--devices", action="store_true", help="draw a virtual device per frame (breastsim.devices)")
     pl.add_argument("--shares", help='lesion-frame share per phantom-id pattern (JSON, fnmatch, first match), '
                                      'e.g. \'{"oat64/*": 0.35, "victre/typ_*": 0.3}\'; default: SOURCES by source')
+    pl.add_argument("--type-shares", action="store_true",
+                    help="lesion frames by recipe type with breastsim/lesion_types.json types[].share (typed phantoms)")
     pl.add_argument("--min-conspicuity", type=float, nargs="?", const=-1.0, default=None,
                     help="lesion views must be as conspicuous as real lesions (breastsim.realism.conspicuity); "
                          "without a value: realism.CONSPICUITY_MIN")
