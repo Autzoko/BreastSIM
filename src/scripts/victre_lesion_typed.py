@@ -8,9 +8,9 @@ unmodified pipeline. Runs inside the breastsim/victre container, with the reposi
 
 <out>/<seed>/p_<seed>.* is a copy of a base phantom (no pcl_* yet). For each of --n lesions a recipe is
 drawn (lesions.sample_recipe("<type-seed>#<i>")), then with documented pipeline interfaces only:
-- mass: Pipeline.generate_spiculated with the breastMass parameters of the recipe's morphology
-  (victre_insert.py KINDS: circumscribed -> smooth, microlobulated / irregular -> lobulated, spiculated) and
-  mean radius alpha = eq. diameter x SECTION_FACTOR / 2.16 (alpha 5 mm -> 10.8 mm measured), clipped to 2-10 mm;
+- mass: the breastMass binary with its own full config (breastmass.py; the pipeline template ignores all keys but
+  imgRes / complexity / seed / alpha) and the keys of the recipe's margin (MARGIN_KEYS); alpha is rescaled once so
+  that the trimmed mass's eq. diameter is the case's in-plane eq. diameter x SECTION_FACTOR;
 - the mass is inserted from its bounding box (cube, +2 voxels; documented lesion_file argument): the breastMass ROI
   (~2.7x the diameter) does not fit into a 25-37 mm thick supine breast;
 - location: a fibroglandular voxel where the mass grown by --margin mm touches no air / skin / nipple /
@@ -30,11 +30,53 @@ from scipy import ndimage
 from Victre import Constants, Pipeline
 
 from breastsim import lesions
-from victre_insert_at import KINDS, ap_axis
+from breastmass import generate_mass
+from victre_insert_at import ap_axis
+
+# breastMass keys per BI-RADS margin (documented breastMass parameters, written to its own config: the pipeline's
+# template ignores them, see breastmass.py). meanShape 0 = spike-, 1 = bump-like low-frequency modifications;
+# meanLFLen / meanLFRad = their relative length / radius; meanInitial = spicule segments (0 = none).
+# Central-section irregularity at alpha 5 mm (after a 1-voxel opening): smooth 0.03, default 0.10, bumps with
+# LFLen 0.25 0.14, LFRad 0.35 0.13, spikes with LFLen 0.25 0.12 (2026-10-28).
+MARGIN_KEYS = {
+    "circumscribed": dict(meanInitial=0, stdInitial=0),                                   # near default, no spicules
+    "lobulated": dict(meanShape=1.0, meanLFLen=0.25, meanLFRad=0.35, meanInitial=0, stdInitial=0),   # microlobulated
+    "indistinct": dict(meanShape=1.0, meanLFLen=0.25, meanInitial=0, stdInitial=0),       # indistinct / angular
+    "spiculated": dict(meanShape=0.0, meanLFLen=0.25),                                    # spikes + default spicules
+}
+
 
 # the real eq. diameter is the in-plane section of the annotated (largest) view; random views through a mass of
 # that 3D eq. diameter give 0.906 x on average (les_v6: 105 lesion frames) -> masses 1.10 x larger
 SECTION_FACTOR = 1.10
+
+
+def margin_class(r):
+    m = r["margin"]
+    if "spiculated" in m:
+        return "spiculated"
+    if "microlobulated" in m:
+        return "lobulated"
+    return "circumscribed" if m == "circumscribed" else "indistinct"
+
+
+def trim(body):
+    """Mass core (opening with a ball of 0.2 x the radius removes spicules) + what lies within 0.5 x its radius:
+    breastMass spicules / fragments can reach 20-30 mm, which no supine breast holds and the imaging mask drops
+    anyway. Distance transforms on the bounding box (a morphological opening of a 500^3 spiculated mass cube with
+    a ball took hours and 24 GB)."""
+    sl = ndimage.find_objects(body.astype(np.uint8))[0]
+    b = body[sl]
+    r_all = (3 * b.sum() / (4 * np.pi)) ** (1 / 3)
+    rb = max(1.0, 0.2 * r_all)
+    eroded = ndimage.distance_transform_edt(b) > rb
+    core = ndimage.distance_transform_edt(~eroded) <= rb if eroded.any() else b
+    comp, n = ndimage.label(core)
+    main = comp == 1 + int(np.argmax(ndimage.sum(comp > 0, comp, range(1, n + 1))))
+    r_main = (3 * main.sum() / (4 * np.pi)) ** (1 / 3)
+    out = np.zeros(body.shape, np.uint8)
+    out[sl] = b & (ndimage.distance_transform_edt(~main) <= 0.5 * r_main)
+    return out
 
 
 def pick_location(p, mass, margin_mm, depth, rng, tries=2000):
@@ -89,32 +131,15 @@ def main():
     out = []
     for i in range(a.n):
         r = lesions.sample_recipe(f"{a.type_seed}#{i}")
-        kind = lesions.mass_kind(r)
-        cx, shape, spic = KINDS[kind]
-        alpha = float(np.clip((r["eqdiam_mm"] or 10.0) * SECTION_FACTOR / 2.16, 2.0, 10.0))
-        params = {**Constants.VICTRE_DEFAULT_SPICULATED_MASS, "complexity": cx, "meanShape": shape,
-                  "meanInitial": spic, "stdInitial": 365 if spic else 0, "imgRes": vox}
-        p.arguments_spiculated.update(params)
+        kind = margin_class(r)
         mass_seed = 1000 * a.type_seed + i + 1
-        p.generate_spiculated(seed=mass_seed, size=alpha)
-        # the breastMass ROI is ~2.7x the mass diameter, more than a supine breast is thick: insert the same
-        # mass from its bounding box (+2 voxels) through the documented lesion_file argument
-        with h5py.File(p.lesion_file, "r") as f:
-            vol = f["volume"][()]
-        # keep the mass core (opening with 0.2 x the radius removes the spicules) and what lies within 0.5 x its
-        # radius of it, spicule bases included: breastMass spicules / fragments can
-        # reach 20-30 mm (cube up to 55 mm), which no supine breast can hold and which the imaging-resolution
-        # mask drops anyway; real spicules are a few mm
-        body = vol == 1
-        r_all = (3 * body.sum() / (4 * np.pi)) ** (1 / 3)                        # voxels
-        rb = max(1, int(round(0.2 * r_all)))                                    # opening removes spicules
-        ball = np.add.outer(np.add.outer(*[np.arange(-rb, rb + 1) ** 2] * 2), np.arange(-rb, rb + 1) ** 2) <= rb ** 2
-        core = ndimage.binary_opening(body, ball)
-        comp, n = ndimage.label(core if core.any() else body)
-        main = comp == 1 + int(np.argmax(ndimage.sum(comp > 0, comp, range(1, n + 1))))
-        r_main = (3 * main.sum() / (4 * np.pi)) ** (1 / 3)
-        near = ndimage.distance_transform_edt(~main) <= 0.5 * r_main
-        vol = (body & near).astype(np.uint8)
+        target = (r["eqdiam_mm"] or 10.0) * SECTION_FACTOR                 # 3D eq. diameter of the trimmed mass
+        alpha = float(np.clip(target / 2.16, 2.0, 10.0))
+        for it in range(2):                                                 # rescale alpha once to hit the size
+            vol = trim(generate_mass(f"{a.out}/lesions/breastmass", mass_seed, alpha, vox, **MARGIN_KEYS[kind]))
+            eq = (6 * vol.sum() * vox ** 3 / np.pi) ** (1 / 3)
+            if it == 0:
+                alpha = float(np.clip(alpha * target / max(eq, 0.1), 1.0, 12.0))
         sl = ndimage.find_objects(vol)[0]
         side = max(q.stop - q.start for q in sl) + 4                   # cube: insert_lesions needs equal sides
         mass = np.zeros((side,) * 3, bool)
@@ -133,7 +158,7 @@ def main():
         cand, ctr, depth = loc
         p.insert_lesions(lesion_type=Constants.VICTRE_SPICULATED, n=1, lesion_file=crop, locations=[cand])
         eq = float((6 * mass.sum() * vox ** 3 / np.pi) ** (1 / 3))
-        rec = {"recipe": r, "kind": kind, "alpha_mm": round(alpha, 2), "mass_seed": mass_seed,
+        rec = {"recipe": r, "kind": kind, "breastMass": MARGIN_KEYS[kind], "alpha_mm": round(alpha, 2), "mass_seed": mass_seed,
                "eqdiam_mm": round(eq, 2), "centre_depth_mm": round(float(depth), 1), "location_vox": cand,
                "center_mm_zyx": [round(x * vox, 2) for x in ctr], "calcs": 0}
         if r["calc"]:
