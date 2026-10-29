@@ -13,8 +13,8 @@ it at load time (apply_content), deterministically per phantom / lesion:
   image); circumscribed lesions are homogeneous, non-circumscribed / heterogeneous ones keep the square root of
   the backscatter pattern of the host tissue they replaced (entrapped fat / stroma residues) around that level
   (log mean: a full-depth pattern made infiltrating lesions look like background);
-- complex cystic / solid: fluid (anechoic) parts, ~CYSTIC_CORE_FRACTION of the lesion volume, where the
-  replaced host tissue was least echogenic (irregular, anatomy-shaped); without a host pattern the deepest voxels;
+- complex cystic / solid: fluid (anechoic) parts, CYSTIC_CORE_FRACTION of the lesion volume, where the replaced
+  host tissue was least echogenic (irregular, anatomy-shaped; without a host pattern the central voxels);
 - non-circumscribed margins: an infiltration transition zone of TRANSITION_MM on both sides of the boundary
   where tumour and host backscatter mix by volume fraction (linear in intensity with signed distance);
 - echogenic halo (annotated halo): host tissue within HALO_REL_WIDTH x diameter outside the lesion gets
@@ -45,7 +45,7 @@ CONTRAST_CURVE = {"ratio": [0.05, 0.1, 0.2, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0],
 # cysts each, t3c sets): real scanners fill cysts with more clutter / reverberation than the simulated chain, so the
 # fluid level is calibrated, log-interpolated (0.07 - 0.13) to the mean of the two real medians (-1.85).
 FLUID_RATIO = 0.10
-CYSTIC_CORE_FRACTION = 0.4
+CYSTIC_CORE_FRACTION = 0.3       # < 0.5: the lesion median (contrast) stays on the solid part
 TRANSITION_MM = 0.4            # 0.8 mm gave edge_sharpness 0.99 vs real 1.16-1.29 (non-circumscribed)
 HALO_REL_WIDTH = 0.15           # realism.lesion_features measures the halo over 0.15 x diameter
 HALO_FACTOR = 1.5
@@ -154,16 +154,19 @@ def apply_content(vol):
             pat = e_lut[lab] / max(e_lut[main], 1e-6)
         target = np.where(solid, echo_ratio(r) * e_host * pat, amp)
         if r["echo"] == "complex cystic/solid" and solid.any():
-            hv = amp[solid]
-            if hv.std() > 0.1 * hv.mean():
-                # fluid spaces where the replaced host tissue was least echogenic (fat lobules): irregular,
-                # anatomy-shaped cystic parts; at most ~60 % of the lesion
-                core = solid & (amp <= np.quantile(hv, CYSTIC_CORE_FRACTION))
-                if core.sum() > 0.6 * solid.sum():
-                    core &= d_in > np.median(d_in[solid])
-            else:                                                  # no host pattern: deepest voxels
-                core = solid & (d_in > np.quantile(d_in[solid], 1 - CYSTIC_CORE_FRACTION))
+            # fluid spaces = exactly CYSTIC_CORE_FRACTION of the lesion: the voxels where the replaced host tissue
+            # was least echogenic (fat lobules: irregular, anatomy-shaped), ties broken toward the centre. A
+            # quantile threshold on the host pattern took every tied fat voxel (up to ~60 %): the lesion's median
+            # fell into the fluid and complex lesions rendered near-anechoic (-2.26 vs real -0.82)
+            idx = np.flatnonzero(solid)
+            key = amp.ravel()[idx] - 1e-3 * d_in.ravel()[idx] / max(float(d_in.max()), 1e-6)
+            core = np.zeros(solid.shape, bool)
+            core.ravel()[idx[np.argsort(key)[:int(round(CYSTIC_CORE_FRACTION * len(idx)))]]] = True
             target[core] = FLUID_RATIO * e_host
+            # the lesion's median (the measured contrast) now sits at the (0.5 - f) / (1 - f) quantile of the solid
+            # part's speckle: raise the solid part by the Rayleigh quantile ratio so the median matches the case
+            q = (0.5 - CYSTIC_CORE_FRACTION) / (1 - CYSTIC_CORE_FRACTION)
+            target[solid & ~core] /= np.sqrt(-np.log(1 - q) / np.log(2))
         if r["margin"] != "circumscribed":                         # infiltration transition zone
             sd = np.where(L, -d_in, d_out)
             t = np.clip((sd + TRANSITION_MM) / (2 * TRANSITION_MM), 0, 1)

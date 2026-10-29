@@ -22,6 +22,7 @@ Writes pcl_<seed>.* and insertion.json ("lesions": recipe, morphology, alpha, ce
 """
 import argparse
 import json
+import subprocess
 import time
 
 import h5py
@@ -137,11 +138,24 @@ def main():
         mass_seed = 1000 * a.type_seed + i + 1
         target = (r["eqdiam_mm"] or 10.0) * SECTION_FACTOR[kind]           # 3D eq. diameter of the trimmed mass
         alpha = float(np.clip(target / 2.16, 2.0, 10.0))
-        for it in range(3):                                                 # rescale alpha twice to hit the size
-            vol = trim(generate_mass(f"{a.out}/lesions/breastmass", mass_seed, alpha, vox, **MARGIN_KEYS[kind]))
-            eq = (6 * vol.sum() * vox ** 3 / np.pi) ** (1 / 3)
-            if it < 2:
-                alpha = float(np.clip(alpha * target / max(eq, 0.1), 1.5, 12.0))
+        vol = None
+        for attempt in range(3):
+            # breastMass occasionally builds a huge domain for one seed (spicules / LF modifications far out:
+            # a 1381^3 or 1723^3 cube that fails to load, which aborted the whole phantom): retry with another seed
+            try:
+                for it in range(3):                                         # rescale alpha twice to hit the size
+                    vol = trim(generate_mass(f"{a.out}/lesions/breastmass", mass_seed, alpha, vox, **MARGIN_KEYS[kind]))
+                    eq = (6 * vol.sum() * vox ** 3 / np.pi) ** (1 / 3)
+                    if it < 2:
+                        alpha = float(np.clip(alpha * target / max(eq, 0.1), 1.5, 12.0))
+                break
+            except (ValueError, MemoryError, IndexError, subprocess.CalledProcessError) as e:
+                print(json.dumps({"lesion": i, "mass_seed": mass_seed, "retry": repr(e)[:120]}), flush=True)
+                vol, mass_seed = None, mass_seed + 500
+                alpha = float(np.clip(target / 2.16, 2.0, 10.0))
+        if vol is None:
+            print(json.dumps({"lesion": i, "skipped": "breastMass failed 3 times"}))
+            continue
         sl = ndimage.find_objects(vol)[0]
         side = max(q.stop - q.start for q in sl) + 4                   # cube: insert_lesions needs equal sides
         mass = np.zeros((side,) * 3, bool)

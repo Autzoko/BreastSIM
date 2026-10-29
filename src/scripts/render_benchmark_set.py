@@ -26,7 +26,7 @@ from breastsim.realtime.renderer import ImagingParams, PreviewRenderer
 
 
 def visible(gray, les, meta, bound):
-    """Main lesion component as conspicuous as real lesions (realism.conspicuity >= bound)."""
+    """Main lesion component as visible as real lesions (realism.conspicuity >= bound, |contrast| >= CONTRAST_MIN)."""
     from scipy import ndimage as ndi
     comp, k = ndi.label(les)
     main = comp == 1 + int(np.argmax(ndi.sum(les, comp, range(1, k + 1))))
@@ -34,7 +34,7 @@ def visible(gray, les, meta, bound):
         return False
     g = gray.astype(np.float32)
     f = realism.lesion_features(g, main, realism.tissue_mask(g), meta["px_z_mm"])
-    return "contrast_sd" in f and realism.conspicuity(f) >= bound
+    return "contrast_sd" in f and realism.conspicuity(f) >= bound and abs(f["contrast_sd"]) >= realism.CONTRAST_MIN
 
 
 def main():

@@ -403,6 +403,17 @@ def conspicuity(t):
     return np.abs(t["contrast_sd"]) + np.maximum(t["edge_sharpness"] - 1.0, 0)
 
 
+# simulated lesions get no texture / architecture cues beyond contrast and edge, and low-contrast ones that pass the
+# conspicuity bound by their edge alone can be invisible (2026-10-29 check): a positive frame also needs
+# |contrast_sd| >= CONTRAST_MIN (real lesions below it: BrEaST 7.5 %, BUSI 5.2 %, BUS-BRA 1.8 %, TDSC-ABUS 0 %)
+CONTRAST_MIN = 0.15
+
+
+def visible(t):
+    """Lesion rows (dict or DataFrame) as visible as real lesions: conspicuity and contrast floors."""
+    return (conspicuity(t) >= CONSPICUITY_MIN) & (np.abs(t["contrast_sd"]) >= CONTRAST_MIN)
+
+
 def extract(samples, dataset, log=print):
     """Image and lesion feature tables of an iterable of samples."""
     imgs, lesions = [], []

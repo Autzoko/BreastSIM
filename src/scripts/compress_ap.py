@@ -235,6 +235,7 @@ def main():
     ap.add_argument("--lateral-pad-mm", type=float, default=15.0, help="room for the lateral expansion")
     ap.add_argument("--image", default="breastsim/febio")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--keep-work", action="store_true", help="keep model.feb / disp.txt / model.xplt")
     ap.add_argument("--steps", type=int, default=20, help="FEBio time steps (more for stiff / dense phantoms)")
     ap.add_argument("--min-fraction", type=float, default=0.6, help="accept a run that stopped after this load fraction")
     ap.add_argument("--device", default="cpu", help="torch device for the resampling (cpu / cuda)")
@@ -336,6 +337,9 @@ def main():
             out[perm] = cw2
             rec["center_mm_zyx"] = [round(float(x * vox), 2) for x in out]
         (dst / "insertion.json").write_text(json.dumps(ins, indent=1))
+    if not a.keep_work:                       # the FEBio input / displacement log / plot file: ~250 MB per run
+        for f in ("model.feb", "disp.txt", "model.xplt"):
+            (work / f).unlink(missing_ok=True)
     print(json.dumps(gen["compression"]))
 
 
